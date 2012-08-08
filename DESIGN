@@ -1,0 +1,24 @@
+Things handled differently from standard Go:
+* The only types are:
+    - `uint` (16-bit unsigned integer)
+    - `int` (16-bit 2's complement signed integer)
+    - `bool` (true/false value. 0 is false, nonzero is true)
+    - `char` (ASCII value in the bottom 7 bits of a `uint`)
+    - `string` (pointer to a C-style null terminated string, using char
+    - arrays, written `[]T` where `T` is one of these types, including an array type. This is an atomic type in the compiler, implemented behind the scenes as a pointer to memory. It can be indexed, moved around, assigned. Not copied on function calls like in standard Go!
+    - pointers to any of these types, including pointers. Written `*T` where `T` is a type. Pointer values are copied on function calls, so modifying the pointer itself won't change the original.
+* Function calls use the standard "registercall" calling convention: clobbering `A`, `B`, `C`, preserving the other general purpose registers, but not `EX`/`O`. Extra arguments are on the stack, followed by the return address. Return address is at `[SP]`, fourth argument at `[SP+1]`, fifth at `[SP+2]`, etc. Callers are responsible for cleaning up the stack arguments. Return values in `A`, stack unchanged by the callee upon its return. Nothing is specified for allocating or freeing of memory.
+    - As an aside for CubeOS, we currently don't follow that convention internally; our functions preserve, and expect to be preserved, all non-argument registers. These functions will be safe to call from Go functions. Go functions can be safely called from assembly if care is taken to obey this difference of convention.
+* Go functions can have named return values, and multiple return values. Neither of these is supported.
+* Go functions will have a label with their name and package basename, thus: _package_function. Internal label names will be globally unique and unpredictable. Using them in any way other than the compiler does is undefined.
+* `new(T)` is reappropriated to create a new value of the given type `T` on the heap, which is *not* garbage collected.
+* `free(x)` frees the value `x` which was previously created with `new()`. The behavior when `free()`ing something that was not allocated with `new()`, or has already been freed, is undefined. Nasal demons.
+* Methods, interfaces, closures, function pointers, slices, maps, and all concurrency constructs are left out for now. Possibly in a future version. I realize this is all the interesting bits, but so be it.
+* Newly allocated values, local and global values **are not** set to 0. Do not rely on them.
+* Execution begins at _main_main.
+* The output is in the form of standard DCPU-16 assembly, with the syntax of nonstandard directives as used by [https://github.com/jonpovey/das](das). It uses:
+    - `:notch-style` labels
+    - `DAT` pseudoinstruction that compiles literal data into the binary, with values separated by commas and allowing string literals (`DAT "example", 0` inserts a C string literal, including the null terminator, one ASCII value per word).
+* Functions can be "forward-declared" by dropping the `{}` and having a `;` instead. Since function order does not matter, this is actually used to specify the type for an assembly function. The assembly output will then expect a label with that name (in the usual format used for Go functions) to exist that points to a function with the given type. The behavior is undefined when these conditions are not met; whole armies of nasal demons.
+
+
