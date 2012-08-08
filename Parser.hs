@@ -18,6 +18,7 @@ import qualified Data.Map as M
 
 data AST = Ident String
          | Type Type
+         | Block [Statement]
          | LitInt Int
          | LitChar Char
          | LitString String
@@ -31,6 +32,15 @@ data Type = TypeName String
           | TypeVoid -- nonexistent type used for functions without return values
   deriving (Eq, Show)
 
+data Statement = StmtTypeDecl String Type
+               | StmtVarDecl String Type (Maybe Expr)
+               | StmtFunction String [(String, Type)] Type (Maybe [Statement])
+               | StmtLabel String
+  deriving (Show)
+
+data Expr = Expr
+  deriving (Show)
+
 -- syntax!
 -- Standard C expressions and precedence as far as I know, should be possible to use the Parsec helper for that.
 -- C-style comments, line and block. Block comments containing a newline are treated as a newline in the parsing.
@@ -42,13 +52,13 @@ data Type = TypeName String
 -- 
 
 pLetter = oneOf "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
-pIdent :: Parser AST
+pIdent :: Parser String
 pIdent = do
   f <- pLetter
   fs <- many (pLetter <|> digit)
   let i = f:fs
   guard . not $ any (== i) keywords
-  return $ Ident i
+  return i
 
 keywords = ["break", "default", "func", "interface", "select",
             "case", "defer", "go", "map", "struct",
@@ -141,6 +151,9 @@ pLitString = try pLitStringRaw <|> pLitStringInterp
 blanks :: Parser ()
 blanks = many (oneOf " \t\r") >> return ()
 
+blanksAround p = blanks *> p <* blanks
+spacesAround p = spaces *> p <* spaces
+
 -- an "end of line" in Go is either a semicolon or a newline
 eol :: Parser ()
 eol = try (blanks >> newline >> spaces) <|> (blanks >> char ';' >> spaces)
@@ -177,11 +190,11 @@ pTypeFunction = do
     blanks
     char '('
     spaces
-    args <- try (sepBy pType (blanks >> char ',' >> blanks))
-         <|> do
-            argGroups <- sepBy pIdentListAndType (blanks >> char ',' >> blanks)
-            let args = concatMap (\(as, t) -> map (\_ -> t) as) argGroups -- with names, so ungroup and grab just the types
-            return args
+    args <- try (sepBy pType (blanksAround $ char ','))
+           <|> do
+              argGroups <- sepBy pIdentListAndType (blanksAround $ char ',')
+              let args = concatMap (\(as, t) -> map (\_ -> t) as) argGroups -- with names, so ungroup and grab just the types
+              return args
     spaces
     char ')'
     blanks
@@ -191,19 +204,69 @@ pTypeFunction = do
 
 pIdentListAndType :: Parser ([String], Type)
 pIdentListAndType = do
-    idents <- sepBy pIdent (try $ blanks >> char ',' >> blanks)
+    idents <- sepBy pIdent (try $ blanksAround (char ','))
     blanks
     t <- pType
     blanks
-    return (map (\(Ident i) -> i) idents, t)
+    return (idents, t)
 
 
 pTypeName :: Parser Type
-pTypeName = do
-  Ident i <- pIdent
-  return $ TypeName i
-
+pTypeName = TypeName <$> pIdent
 
 pType :: Parser Type
-pType = try (char '(' *> spaces *> pType <* spaces <* char ')') <|> try pTypeLit <|> pTypeName
+pType = try (char '(' *> spacesAround pType <* char ')') <|> try pTypeLit <|> pTypeName
+
+
+
+----------------------------------
+-- blocks and statements
+----------------------------------
+
+pTypeDecl :: Parser [Statement]
+pTypeDecl = do
+    string "type"
+    blanks
+    try (char '(' *> spacesAround (sepBy pTypeDeclInner eol) <* char ')') <|> fmap (:[]) pTypeDeclInner
+  where pTypeDeclInner = StmtTypeDecl <$> (pIdent <* blanks) <*> pType
+
+
+pVarDecl :: Parser [Statement]
+pVarDecl = do
+    string "var"
+    blanks
+    varss <- try (char '(' *> spacesAround (sepBy pVarDeclInner eol) <* char ')') <|> fmap (:[]) pVarDeclInner
+    return $ concat varss
+  where pVarDeclInner = do
+          (vs, t) <- pIdentListAndType
+          blanks
+          defs_ <- option [] $ char '=' *> blanksAround (sepBy pExpr (blanksAround $ char ','))
+          let defs = map Just defs_ ++ repeat Nothing -- fill out the rest of the list with Nothings.
+          return $ zipWith (\v x -> StmtVarDecl v t x) vs defs
+
+
+-- Returns a list of statements even though it's only one. makes it easier to concat everything.
+pFuncDecl :: Parser [Statement]
+pFuncDecl = do
+    string "func"
+    blanks
+    name <- pIdent
+    blanks
+    char '('
+    spaces
+    args <- do
+      argGroups <- sepBy pIdentListAndType (blanksAround $ char ',')
+      let args = concatMap (\(as, t) -> map (\a -> (a,t)) as) argGroups -- ungroup and pair each with its type
+      return args
+    spaces
+    char ')'
+    blanks
+    ret <- try $ option TypeVoid pType
+    blanks
+    body <- try $ option Nothing $ Just <$> (char '{' *> spacesAround (sepBy pStatement eol) <* char '}')
+    return [StmtFunction name args ret body]
+
+pStatement = return $ StmtLabel "foo"
+
+pExpr = return Expr
 
