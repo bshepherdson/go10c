@@ -27,4 +27,6 @@ Things handled differently from standard Go:
 * Variadic functions and the `...` syntax for them are not supported.
 * Types cannot be omitted in variable declarations, even when unambiguous default values are given.
 * Short variable declarations (with `:=`) are not supported because inferring of types from expressions is not supported. This is one of my highest priorities for v1.1.
+* Struct literals must have their keys provided. Array literals do not support indexes.
+* Taking the address of a literal, including a struct or array literal, is not supported.
 
