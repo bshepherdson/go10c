@@ -4,6 +4,7 @@ Things handled differently from standard Go:
     - `int` (16-bit 2's complement signed integer)
     - `bool` (true/false value. 0 is false, nonzero is true)
     - `char` (ASCII value in the bottom 7 bits of a `uint`)
+        - character literals support only `'a'`, `'\n'` and friends, '\777' (octal) and `'\x34'` (hex). They do not support `'\u340f'` or `'\Udeadbeef'` style, since there is no Unicode support.
     - `string` (pointer to a C-style null terminated string, using char
     - arrays, written `[]T` where `T` is one of these types, including an array type. This is an atomic type in the compiler, implemented behind the scenes as a pointer to memory. It can be indexed, moved around, assigned. Not copied on function calls like in standard Go!
     - pointers to any of these types, including pointers. Written `*T` where `T` is a type. Pointer values are copied on function calls, so modifying the pointer itself won't change the original.
