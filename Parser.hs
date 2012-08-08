@@ -17,10 +17,19 @@ import Data.Char (chr)
 import qualified Data.Map as M
 
 data AST = Ident String
+         | Type Type
          | LitInt Int
          | LitChar Char
          | LitString String
   deriving (Show)
+
+data Type = TypeName String 
+          | TypeArray Type
+          | TypeStruct [(String, Type)] -- a struct with its parameters and their types.
+          | TypePointer Type
+          | TypeFunction [Type] Type -- a function giving its argument types and (singular, in my Go) return type.
+          | TypeVoid -- nonexistent type used for functions without return values
+  deriving (Eq, Show)
 
 -- syntax!
 -- Standard C expressions and precedence as far as I know, should be possible to use the Parsec helper for that.
@@ -126,3 +135,75 @@ pLitStringInterp = do
 
 pLitString :: Parser AST
 pLitString = try pLitStringRaw <|> pLitStringInterp
+
+
+-- whitespace but not newlines
+blanks :: Parser ()
+blanks = many (oneOf " \t\r") >> return ()
+
+-- an "end of line" in Go is either a semicolon or a newline
+eol :: Parser ()
+eol = try (blanks >> newline >> spaces) <|> (blanks >> char ';' >> spaces)
+
+
+------------------------------------------------
+-- TYPES
+------------------------------------------------
+
+pTypeLit :: Parser Type
+pTypeLit = try pTypePointer <|> try pTypeArray <|> try pTypeStruct <|> pTypeFunction
+
+pTypePointer :: Parser Type
+pTypePointer = TypePointer <$> (char '*' *> blanks *> pType)
+
+pTypeArray :: Parser Type
+pTypeArray = TypeArray <$> (string "[]" *> blanks *> pType)
+
+pTypeStruct :: Parser Type
+pTypeStruct = do
+    string "struct"
+    blanks
+    char '{'
+    spaces
+    fieldLines <- sepBy pIdentListAndType eol
+    let fields = concatMap (\(is, t) -> map (\i -> (i,t)) is) fieldLines -- ungroup the fields
+    char '}'
+    return $ TypeStruct fields
+
+
+pTypeFunction :: Parser Type
+pTypeFunction = do
+    string "func"
+    blanks
+    char '('
+    spaces
+    args <- try (sepBy pType (blanks >> char ',' >> blanks))
+         <|> do
+            argGroups <- sepBy pIdentListAndType (blanks >> char ',' >> blanks)
+            let args = concatMap (\(as, t) -> map (\_ -> t) as) argGroups -- with names, so ungroup and grab just the types
+            return args
+    spaces
+    char ')'
+    blanks
+    ret <- option TypeVoid pType
+    return $ TypeFunction args ret
+
+
+pIdentListAndType :: Parser ([String], Type)
+pIdentListAndType = do
+    idents <- sepBy pIdent (try $ blanks >> char ',' >> blanks)
+    blanks
+    t <- pType
+    blanks
+    return (map (\(Ident i) -> i) idents, t)
+
+
+pTypeName :: Parser Type
+pTypeName = do
+  Ident i <- pIdent
+  return $ TypeName i
+
+
+pType :: Parser Type
+pType = try (char '(' *> spaces *> pType <* spaces <* char ')') <|> try pTypeLit <|> pTypeName
+

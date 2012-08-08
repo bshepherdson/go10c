@@ -21,5 +21,10 @@ Things handled differently from standard Go:
     - `:notch-style` labels
     - `DAT` pseudoinstruction that compiles literal data into the binary, with values separated by commas and allowing string literals (`DAT "example", 0` inserts a C string literal, including the null terminator, one ASCII value per word).
 * Functions can be "forward-declared" by dropping the `{}` and having a `;` instead. Since function order does not matter, this is actually used to specify the type for an assembly function. The assembly output will then expect a label with that name (in the usual format used for Go functions) to exist that points to a function with the given type. The behavior is undefined when these conditions are not met; whole armies of nasal demons.
+* Constants are unsupported for now.
+* Struct changes:
+    - Tags are not supported.
+    - Anonymous fields are not supported.
+* Variadic functions and the `...` syntax for them are not supported.
 
 
