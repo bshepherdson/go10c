@@ -34,9 +34,23 @@ data Statement = StmtTypeDecl String Type
                | StmtVarDecl String Type (Maybe Expr)
                | StmtFunction String [(String, Type)] Type (Maybe [Statement])
                | StmtLabel String
+               | StmtExpr Expr
+               | StmtInc Expr
+               | StmtDec Expr
+               | StmtAssignment (Maybe String) Expr Expr -- the string is an operand, or Nothing for basic assignment
+               | StmtEmpty
+               | StmtIf Statement Expr [Statement] [Statement] -- the initializer, condition, block and else block. (the else block contains a single StmtIf, for an "else if")
+               | StmtFor Statement Expr Statement [Statement] -- initializer, condition, increment, block
+               | StmtSwitch Statement Expr [([Expr], [Statement])] [Statement] -- initializer, switching variable (can be omitted, then equiv to "true". parser fills this in),
+                                                                               -- list of cases (comma-separated list of expr values, and bodies), default case (maybe empty)
+               | StmtReturn (Maybe Expr)
+               | StmtBreak String -- label
+               | StmtContinue String -- label
+               | StmtGoto String -- label
   deriving (Show)
 
 data Expr = LitInt Int
+          | LitBool Bool
           | LitChar Char
           | LitString String
           | LitStruct Type [(String, Expr)]
@@ -193,10 +207,135 @@ pFuncDecl = do
 pBlock :: Parser [Statement]
 pBlock = concat <$> (char '{' *> spacesAround (sepBy pStatement eol) <* char '}')
 
+
+pLabeledStmt :: Parser [Statement]
+pLabeledStmt = do
+    label <- pIdent
+    char ':'
+    spaces
+    s <- pStatement
+    return (StmtLabel label : s)
+
+
+-- expressions can be statements too
+pExprStmt :: Parser [Statement]
+pExprStmt = (:[]) . StmtExpr <$> pExpr
+
+
+pIncDecStmt :: Parser [Statement]
+pIncDecStmt = do
+    x <- pExpr
+    f_ <- try (string "++") <|> string "--"
+    let f = case f_ of
+                "++" -> StmtInc
+                "--" -> StmtDec
+    return [f x]
+
+
+pAssignmentStmt :: Parser [Statement]
+pAssignmentStmt = do
+    lhs <- pExpr
+    blanks
+    op <- pAssignOp
+    char '='
+    blanks
+    rhs <- pExpr
+    return [StmtAssignment op lhs rhs]
+
+pAssignOp :: Parser (Maybe String)
+pAssignOp = try (Just <$> pOps) <|> return Nothing
+  where pOps = foldl1 (<|>) $ map string ["*", "/", "%", "<<", ">>", "&", "&^", "+", "-", "|", "^"]
+
+
+pReturnStmt :: Parser [Statement]
+pReturnStmt = do
+    string "return"
+    blanks
+    x <- option Nothing (Just <$> pExpr)
+    return [StmtReturn x]
+
+
+pIfStmt :: Parser [Statement]
+pIfStmt = do
+    string "if"
+    blanks
+    initial <- option StmtEmpty $ head <$> pSimpleStatement <* blanks <* char ';'
+    cond <- pExpr
+    ifBlock <- pBlock
+    elseBlock <- option [] $ do
+            blanks
+            string "else"
+            try pIfStmt <|> try pBlock <|> return [] -- default is no block
+    return [StmtIf initial cond ifBlock elseBlock]
+
+
+-- TODO Implement these
+pSwitchStmt :: Parser [Statement]
+pSwitchStmt = fail "switch not implemented" -- do
+    --string "switch"
+    --blanks
+    --initial <- option StmtEmpty $ pSimpleStmt <* blanks <* char ';'
+    --var <- pExpr
+    --blanks
+    --char '{'
+    --spaces
+    --cases <- sepBy pCaseStmt (eol >> spaces)
+
+pFallthroughStmt :: Parser [Statement]
+pFallthroughStmt = fail "fallthrough not implemented"
+
+
+pJumpLike :: String -> (String -> Statement) -> Parser [Statement]
+pJumpLike s f = do
+    string s
+    blanks
+    label <- pIdent 
+    return [f label]
+
+pGotoStmt, pBreakStmt, pContinueStmt :: Parser [Statement]
+pGotoStmt = pJumpLike "goto" StmtGoto
+pBreakStmt = pJumpLike "break" StmtBreak
+pContinueStmt = pJumpLike "continue" StmtContinue
+
+
+-- TODO Implement range clauses
+pForStmt :: Parser [Statement]
+pForStmt = try pForStmtCStyle <|> pForStmtConditionOnly
+
+pForStmtCStyle :: Parser [Statement]
+pForStmtCStyle = do
+    string "for"
+    blanks
+    initial <- option StmtEmpty (head <$> pSimpleStatement)
+    blanksAround (char ';')
+    cond <- option (LitBool True) pExpr
+    blanksAround (char ';')
+    inc <- option StmtEmpty (head <$> pSimpleStatement)
+    blanks
+    block <- pBlock
+    return [StmtFor initial cond inc block]
+
+
+pForStmtConditionOnly :: Parser [Statement]
+pForStmtConditionOnly = do
+    string "for"
+    blanks
+    cond <- option (LitBool True) pExpr
+    blanks
+    block <- pBlock
+    return [StmtFor StmtEmpty cond StmtEmpty block]
+
+
+
+pSimpleStatement :: Parser [Statement]
+pSimpleStatement = try pExprStmt <|> {- try pIncDecStmt <|>-} pAssignmentStmt
+
 pStatement :: Parser [Statement]
-pStatement = try pTypeDecl <|> try pVarDecl <|> try pFuncDecl <|> pBlock
-
-
+pStatement = try pTypeDecl <|> try pVarDecl <|> try pFuncDecl <|>
+             {-try pLabeledStmt <|>-} try pSimpleStatement <|>
+             try pReturnStmt <|> try pBreakStmt <|> try pContinueStmt <|> try pGotoStmt <|> try pFallthroughStmt <|>
+             try pBlock <|>
+             try pIfStmt <|> try pSwitchStmt <|> pForStmt
 
 -----------------------------------------
 -- expressions
@@ -220,6 +359,11 @@ keywords = ["break", "default", "func", "interface", "select",
 
 pQualIdent :: Parser QualIdent
 pQualIdent = QualIdent <$> pIdent <* char '.' <*> pIdent
+
+pLitBool :: Parser Expr
+pLitBool = try (string "true" >> return (LitBool True)) <|> (string "false" >> return (LitBool False))
+
+
 
 pLitIntDec, pLitIntHex, pLitIntOct :: Parser Int
 pLitIntDec = read <$> many1 digit
@@ -322,7 +466,7 @@ pLitCompStruct t = LitStruct t <$> sepBy pElement spacesComma
   where pElement = (,) <$> pIdent <* char ':' <* spaces <*> pExpr
 
 pLiteral :: Parser Expr
-pLiteral = try pLitString <|> try pLitChar <|> try pLitInt <|> try pLitComposite
+pLiteral = try pLitString <|> try pLitChar <|> try pLitInt <|> try pLitBool <|> pLitComposite
 
 pOperand :: Parser Expr
 pOperand = try pLiteral <|> try (QualVar <$> pQualIdent) <|> (Var <$> pIdent)
@@ -376,8 +520,8 @@ pCall = do
 pPrimExpr :: Parser Expr
 pPrimExpr = try pOperand <|> try pConversion <|> try pBuiltinCall <|> try pSelector <|> try pIndex <|> pCall
 
-prefix s = Prefix (UnOp <$> spacesAround (string s))
-binary s = Infix (BinOp <$> spacesAround (string s)) AssocLeft
+prefix s = Prefix (UnOp <$> try (blanksAround (string s)))
+binary s = Infix (BinOp <$> try (blanksAround (string s))) AssocLeft
 
 table = [map prefix ["+", "-", "!", "^", "*", "&"]
         ,map binary ["*", "/", "%", "<<", ">>", "&", "&^"]
@@ -391,6 +535,7 @@ table = [map prefix ["+", "-", "!", "^", "*", "&"]
 pBaseExpr :: Parser Expr
 pBaseExpr = try (char '(' *> spacesAround pExpr <* char ')') <|> pPrimExpr 
 
+-- HACK: Looking ahead for ++ and -- is a hack, but the expression parses enters an infinite loop on "i++" otherwise.
 pExpr :: Parser Expr
 pExpr = buildExpressionParser table pBaseExpr
 

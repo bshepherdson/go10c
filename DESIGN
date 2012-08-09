@@ -29,4 +29,6 @@ Things handled differently from standard Go:
 * Short variable declarations (with `:=`) are not supported because inferring of types from expressions is not supported. This is one of my highest priorities for v1.1.
 * Struct literals must have their keys provided. Array literals do not support indexes.
 * Taking the address of a literal, including a struct or array literal, is not supported.
+* Multi-value assignments are not supported.
+* For loop range clauses are not supported.
 
