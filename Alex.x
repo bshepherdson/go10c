@@ -20,6 +20,8 @@ $charesc = [abfnrtv\\] -- backslashable characters, except for quotes
 @escape = \\ ($charesc | $octdigit{3} | x $hexdigit{2})
 @string = $graphical # [\"\\] | " " | @escape | \\\" | $blank+
 
+@ident = $alpha [$alpha $digit]*
+
 tokens :-
 
 $blank+ ; -- ignore non-newline whitespace
@@ -70,6 +72,12 @@ switch      { keyword LSwitch }
 type        { keyword LType }
 var         { keyword LVar }
 
+
+-- identifiers
+_           { keyword LPlaceholder }
+@ident      { mkL LIdent }
+
+
 -- operators
 
 "+"|"-"|"*"|\/|"%"|"&"|\||"^"|"<<"|">>"|"&^"|"+="|"-="|"*="|"/="|"%="|"&="| \|= | "^=" | "<<=" | ">>=" | "&^=" | "&&" | \|\| | "<-" | "++" | "--" | "==" | "<" | ">" | "=" | "!" | "!=" | "<=" | ">=" | ":=" | "..." { mkL LOp }
@@ -83,6 +91,7 @@ var         { keyword LVar }
 "]" { mkL (const LCloseSB) }
 
 ":" { mkL (const LColon) }
+"." { mkL (const LDot) }
 
 eof { mkL (const LEOF) }
 
@@ -93,6 +102,7 @@ data Lexeme = L AlexPosn LexemeClass String
 
 data LexemeClass = LEOL
                  | LEOF
+                 | LIdent String
                  | LInt Int
                  | LString String
                  | LChar Char
@@ -129,6 +139,7 @@ data LexemeClass = LEOL
                  | LOpenSB
                  | LCloseSB
                  | LColon
+                 | LDot
     deriving (Show)
 
 
