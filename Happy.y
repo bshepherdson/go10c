@@ -1,11 +1,11 @@
 {
 module Parser where
 
-import Lexer
+import GoLexer
 }
 
 %name parseGo
-%tokentype { LexemeClass }
+%tokentype { Token }
 %error { parseError }
 
 %token
@@ -106,68 +106,6 @@ Factor : intlit         { LitInt $1 }
 
 {
 
-data LexemeClass = LEOL
-                 | LEOF
-                 | LIdent String
-                 | LInt Int
-                 | LString String
-                 | LChar Char
-                 | LBool Bool
-                 | LBreak
-                 | LCase
-                 | LChan
-                 | LConst
-                 | LContinue
-                 | LDefault
-                 | LDefer
-                 | LElse
-                 | LFallthrough
-                 | LFor
-                 | LGo
-                 | LGoto
-                 | LIf
-                 | LImport
-                 | LInterface
-                 | LMap
-                 | LPackage
-                 | LRange
-                 | LReturn
-                 | LSelect
-                 | LStruct
-                 | LSwitch
-                 | LType
-                 | LVar
-                 | LOp String
-                 | LOpenP
-                 | LCloseP
-                 | LOpenCB
-                 | LCloseCB
-                 | LOpenSB
-                 | LCloseSB
-                 | LColon
-                 | LDot
-    deriving (Show)
-
-data QualIdent = QualIdent { package :: String, name :: String }
-  deriving (Show)
-
-data Expr = LitInt Int
-          | LitBool Bool
-          | LitChar Char
-          | LitString String
-          | LitStruct Type [(String, Expr)]
-          | LitArray Type [Expr]
-          | Var String
-          | QualVar QualIdent
-          | Selector Expr String
-          | Index Expr Expr -- array expression and index expression
-          | Call Expr [Expr] -- function expression and argument expressions
-          | BuiltinCall String (Maybe Type) [Expr] -- name of builtin, maybe a type as the first arg, and a list of parameter expressions
-          | Conversion Type Expr
-          | UnOp String Expr -- unary operator and expression
-          | BinOp String Expr Expr -- binary operator and operands
-    deriving (Show)
-
 data Type = TypeName String 
           | TypeArray Type
           | TypeStruct [(String, Type)] -- a struct with its parameters and their types.
@@ -195,6 +133,30 @@ data Statement = StmtTypeDecl String Type
                | StmtGoto String -- label
   deriving (Show)
 
-parseError _ = error "Parse error"
+data Expr = LitInt Int
+          | LitBool Bool
+          | LitChar Char
+          | LitString String
+          | LitStruct Type [(String, Expr)]
+          | LitArray Type [Expr]
+          | Var String
+          | QualVar QualIdent
+          | Selector Expr String
+          | Index Expr Expr -- array expression and index expression
+          | Call Expr [Expr] -- function expression and argument expressions
+          | BuiltinCall String (Maybe Type) [Expr] -- name of builtin, maybe a type as the first arg, and a list of parameter expressions
+          | Conversion Type Expr
+          | UnOp String Expr -- unary operator and expression
+          | BinOp String Expr Expr -- binary operator and operands
+  deriving (Show)
+
+data QualIdent = QualIdent { package :: String, name :: String }
+  deriving (Show)
+
+parseError s = error $ "Parse error: " ++ show s
+
+main = do
+    inStr <- getContents
+    print $ parseGo $ alexScanTokens inStr
 
 }

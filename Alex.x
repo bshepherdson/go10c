@@ -1,10 +1,11 @@
 {
-module Lexer where
+module GoLexer where
 
 import Numeric (readOct, readHex)
+import qualified Data.Map as M
 }
 
-%wrapper "monad"
+%wrapper "basic"
 
 $digit = 0-9
 $octdigit = 0-7
@@ -25,16 +26,16 @@ $charesc = [abfnrtv\\] -- backslashable characters, except for quotes
 tokens :-
 
 $blank+ ; -- ignore non-newline whitespace
-\n | \; { mkL (const LEOL) }
+\n | \; { const LEOL }
 
 -- comments to be ignored
 \/\/.* ;
 \/\*"$any*\*\/ ;
 
 -- string and character literals
-\" @string* \"          { mkL LString }
-\` [^`]* \`             { mkL LString }
-\' ($graphical # [\'\\] | \\\' | @escape) \'  { mkL (LChar . head) }
+\" @string* \"          { LString . init . tail . escape stringEscapes } -- strip the leading and trailing quotes.
+\` [^`]* \`             { LString . init . tail } -- likewise.
+\' ($graphical # [\'\\] | \\\' | @escape) \'  { LChar . head . tail . escape charEscapes } -- first character inside the quotes
 
 -- integer literals
 0 $octdigit+                { mkInt readOct }
@@ -42,8 +43,8 @@ $digit+                     { mkInt reads   }
 0x $hexdigit+               { mkInt readHex }
 
 -- boolean literals
-true    { mkL (const $ LBool True) }
-false   { mkL (const $ LBool False) }
+true    { const $ LBool True }
+false   { const $ LBool False }
 
 
 -- keywords
@@ -74,89 +75,90 @@ var         { keyword LVar }
 
 
 -- identifiers
-_           { keyword LPlaceholder }
-@ident      { mkL LIdent }
+@ident      { LIdent }
 
 
 -- operators
 
-"+"|"-"|"*"|\/|"%"|"&"|\||"^"|"<<"|">>"|"&^"|"+="|"-="|"*="|"/="|"%="|"&="| \|= | "^=" | "<<=" | ">>=" | "&^=" | "&&" | \|\| | "<-" | "++" | "--" | "==" | "<" | ">" | "=" | "!" | "!=" | "<=" | ">=" | ":=" | "..." { mkL LOp }
+"+"|"-"|"*"|\/|"%"|"&"|\||"^"|"<<"|">>"|"&^"|"+="|"-="|"*="|"/="|"%="|"&="| \|= | "^=" | "<<=" | ">>=" | "&^=" | "&&" | \|\| | "<-" | "++" | "--" | "==" | "<" | ">" | "=" | "!" | "!=" | "<=" | ">=" | ":=" | "..." { LOp }
 
 -- bracketing
-"(" { mkL (const LOpenP) }
-")" { mkL (const LCloseP) }
-"{" { mkL (const LOpenCB) }
-"}" { mkL (const LCloseCB) }
-"[" { mkL (const LOpenSB) }
-"]" { mkL (const LCloseSB) }
+"(" { (const LOpenP) }
+")" { (const LCloseP) }
+"{" { (const LOpenCB) }
+"}" { (const LCloseCB) }
+"[" { (const LOpenSB) }
+"]" { (const LCloseSB) }
 
-":" { mkL (const LColon) }
-"." { mkL (const LDot) }
+":" { (const LColon) }
+"." { (const LDot) }
 
-eof { mkL (const LEOF) }
+eof { (const LEOF) }
 
 {
 
-data Lexeme = L AlexPosn LexemeClass String
-    deriving (Show)
-
-data LexemeClass = LEOL
-                 | LEOF
-                 | LIdent String
-                 | LInt Int
-                 | LString String
-                 | LChar Char
-                 | LBool Bool
-                 | LBreak
-                 | LCase
-                 | LChan
-                 | LConst
-                 | LContinue
-                 | LDefault
-                 | LDefer
-                 | LElse
-                 | LFallthrough
-                 | LFor
-                 | LGo
-                 | LGoto
-                 | LIf
-                 | LImport
-                 | LInterface
-                 | LMap
-                 | LPackage
-                 | LRange
-                 | LReturn
-                 | LSelect
-                 | LStruct
-                 | LSwitch
-                 | LType
-                 | LVar
-                 | LOp String
-                 | LOpenP
-                 | LCloseP
-                 | LOpenCB
-                 | LCloseCB
-                 | LOpenSB
-                 | LCloseSB
-                 | LColon
-                 | LDot
+data Token = LEOL
+           | LEOF
+           | LIdent String
+           | LInt Int
+           | LString String
+           | LChar Char
+           | LBool Bool
+           | LBreak
+           | LCase
+           | LChan
+           | LConst
+           | LContinue
+           | LDefault
+           | LDefer
+           | LElse
+           | LFallthrough
+           | LFor
+           | LGo
+           | LGoto
+           | LIf
+           | LImport
+           | LInterface
+           | LMap
+           | LPackage
+           | LRange
+           | LReturn
+           | LSelect
+           | LStruct
+           | LSwitch
+           | LType
+           | LVar
+           | LOp String
+           | LOpenP
+           | LCloseP
+           | LOpenCB
+           | LCloseCB
+           | LOpenSB
+           | LCloseSB
+           | LColon
+           | LDot
     deriving (Show)
 
 
-mkL :: (String -> LexemeClass) -> AlexInput -> Int -> Alex Lexeme
-mkL f (p,_,_,str) len = return $ L p (f s) s
-    where s = take len str
+mkInt :: ReadS Int -> String -> Token
+mkInt f s = case f s of
+    [(x,"")] -> LInt x
+    _        -> error "Broken integer literal"
 
-mkInt :: ReadS Int -> AlexInput -> Int -> Alex Lexeme
-mkInt f ai@(p,_,_,str) len = case f (take len str) of
-    [(x,"")] -> mkL (const $ LInt x) ai len
-    _ -> alexError "Broken integer literal"
+keyword = const
 
-keyword :: LexemeClass -> AlexInput -> Int -> Alex Lexeme
-keyword c = mkL (const c)
+baseEscapes, charEscapes, stringEscapes :: M.Map Char Char
+baseEscapes = M.fromList [('a', '\a'), ('b', '\b'), ('f', '\f'), ('n', '\n'), ('r', '\r'), ('t', '\t'), ('v', '\v'), ('\\', '\\')]
+charEscapes = M.insert '\'' '\'' baseEscapes
+stringEscapes = M.insert '"' '"' baseEscapes
 
-
-alexEOF = return $ L (AlexPn 0 0 0) LEOF ""
+-- collapses literal backslashes in the string into escape characters
+escape :: M.Map Char Char -> String -> String
+escape _ [] = []
+escape m ('\\':c:s) = case M.lookup c m of
+    Just esc -> esc : escape m s
+    Nothing  -> error $ "Illegal escape character: \\" ++ [c]
+escape m (x:xs) = x : escape m xs
 
 }
 
