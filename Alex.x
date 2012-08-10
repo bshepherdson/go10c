@@ -31,7 +31,7 @@ $blank+ ; -- ignore non-newline whitespace
 
 -- comments to be ignored
 \/\/.* ;
-\/\*"$any*\*\/ ;
+-- \/\*"$any*\*\/ ;  -- disabled because it doesn't work and I can't find a way to do it without switching to the monad wrapper.
 
 -- string and character literals
 \" @string* \"          { LString . init . tail . escape stringEscapes } -- strip the leading and trailing quotes.
@@ -74,6 +74,11 @@ struct      { keyword LStruct }
 switch      { keyword LSwitch }
 type        { keyword LType }
 var         { keyword LVar }
+
+-- builtins
+new         { keyword LNew }
+delete      { keyword LDelete }
+panic       { keyword LPanic }
 
 
 -- identifiers
@@ -133,6 +138,9 @@ data Token = LNewline
            | LSwitch
            | LType
            | LVar
+           | LNew
+           | LDelete
+           | LPanic
            | LOp String
            | LOpenP
            | LCloseP

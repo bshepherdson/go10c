@@ -42,6 +42,9 @@ import GoLexer
     switch      { LSwitch }
     type        { LType }
     var         { LVar }
+    new         { LNew }
+    delete      { LDelete }
+    panic       { LPanic }
     OP          { LOpenP }
     CP          { LCloseP }
     OCB         { LOpenCB }
@@ -92,7 +95,7 @@ import GoLexer
 %%
 
 SourceFile :: { SourceFile }
-           : PackageClause eol Blanks ImportDecls Blanks TopLevelDecls        { SourceFile $1 (reverse $4) (reverse $6) }
+           : PackageClause eol Blanks ImportDecls Blanks TopLevelDecls Blanks   { SourceFile $1 (reverse $4) (reverse $6) }
 
 PackageClause :: { String }
 PackageClause : package ident       { $2 }
@@ -101,6 +104,7 @@ ImportDecls :: { [Import] }
 ImportDecls : ImportDecls eol ImportDecl    { $3 ++ $1 }
             | ImportDecls eol               { $1 }
             | ImportDecl                    { $1 }
+            | {- empty -}                   { [] }
 
 ImportDecl :: { [Import] }
 ImportDecl : import OP ImportSpecs CP       { $3 }
@@ -221,6 +225,8 @@ FunctionDecl :: { [Statement] }
 FunctionDecl : func ident Parameters Type Block             { [StmtFunction $2 $3 $4 (Just $5)] }
              | func ident Parameters Block                  { [StmtFunction $2 $3 TypeVoid (Just $4)] }
              | func ident Parameters Type                   { [StmtFunction $2 $3 $4 Nothing] }
+             | func ident Parameters                        { [StmtFunction $2 $3 TypeVoid Nothing] }
+
 Parameters :: { [(String, Type)] }
 Parameters : OP ParameterList CP                            { reverse $2 }
            | OP CP                                          { [] }
@@ -272,6 +278,7 @@ SimpleStmt : EmptyStmt          { $1 }
            | ExpressionStmt     { $1 }
            | IncDecStmt         { $1 }
            | Assignment         { $1 }
+           | ShortVarDecl       { $1 }
 
 EmptyStmt :: { [Statement] }
 EmptyStmt : { [] }
@@ -285,24 +292,24 @@ IncDecStmt : Expression '++'                { [StmtInc $1] }
 
 
 IfStmt :: { [Statement] }
-IfStmt : if Initializer Expression Block else ElseBlock     { [StmtIf $2 $3 $4 $6] }
-       | if Initializer Expression Block                    { [StmtIf $2 $3 $4 []] }
+IfStmt : if SimpleStmt semi Expression Block else ElseBlock     { [StmtIf $2 $4 $5 $7] }
+       | if SimpleStmt semi Expression Block                    { [StmtIf $2 $4 $5 []] }
+       | if Expression Block else ElseBlock                     { [StmtIf [] $2 $3 $5] }
+       | if Expression Block                                    { [StmtIf [] $2 $3 []] }
+
 ElseBlock :: { [Statement] }
 ElseBlock : IfStmt                                          { $1 }
           | Block                                           { $1 }
 
 
-Initializer :: { Statement }
-Initializer : SimpleStmt semi   { head $1 }
-            | {- empty -}       { StmtEmpty }
-
-
 SwitchStmt :: { [Statement] }
-SwitchStmt : switch Initializer Expression OCB ExprCaseClauses CCB      { [StmtSwitch $2 $3 (reverse $5)] }
-           | switch Initializer OCB ExprCaseClauses CCB                 { [StmtSwitch $2 (LitBool True) (reverse $4)] }
+SwitchStmt : switch SimpleStmt semi Expression OCB Blanks ExprCaseClauses Blanks CCB      { [StmtSwitch $2 $4 (reverse $7)] }
+           | switch SimpleStmt semi OCB Blanks ExprCaseClauses Blanks CCB                 { [StmtSwitch $2 (LitBool True) (reverse $6)] }
+           | switch Expression OCB Blanks ExprCaseClauses Blanks CCB                      { [StmtSwitch [] $2 (reverse $5)] }
+           | switch OCB Blanks ExprCaseClauses Blanks CCB                                 { [StmtSwitch [] (LitBool True) (reverse $4)] }
 
 ExprCaseClauses :: { [([Expr], [Statement])] }
-ExprCaseClauses : ExprCaseClauses ExprCaseClause        { $2 : $1 }
+ExprCaseClauses : ExprCaseClauses Blanks ExprCaseClause        { $3 : $1 }
                 | ExprCaseClause                        { [$1] }
 
 ExprCaseClause :: { ([Expr], [Statement]) }
@@ -315,17 +322,17 @@ ExprSwitchCase : case ExpressionList                    { reverse $2 }
 
 ForStmt :: { [Statement] }
 ForStmt : for ForClause Block           { [$2 $3] }
-        | for Expression Block          { [StmtFor StmtEmpty $2 StmtEmpty $3] }
+        | for Expression Block          { [StmtFor [] $2 [] $3] }
 
 ForClause :: { [Statement] -> Statement }
-ForClause : SimpleStmt semi Expression semi SimpleStmt      { StmtFor (head $1) $3 (head $5) }
-          | SimpleStmt semi Expression semi                 { StmtFor (head $1) $3 StmtEmpty }
-          | SimpleStmt semi semi SimpleStmt                 { StmtFor (head $1) (LitBool True) (head $4) }
-          | SimpleStmt semi semi                            { StmtFor (head $1) (LitBool True) StmtEmpty }
-          | semi Expression semi SimpleStmt                 { StmtFor StmtEmpty $2 (head $4) }
-          | semi Expression semi                            { StmtFor StmtEmpty $2 StmtEmpty }
-          | semi semi SimpleStmt                            { StmtFor StmtEmpty (LitBool True) (head $3) }
-          | semi semi                                       { StmtFor StmtEmpty (LitBool True) StmtEmpty }
+ForClause : SimpleStmt semi Expression semi SimpleStmt      { StmtFor $1 $3 $5 }
+          | SimpleStmt semi Expression semi                 { StmtFor $1 $3 [] }
+          | SimpleStmt semi semi SimpleStmt                 { StmtFor $1 (LitBool True) $4 }
+          | SimpleStmt semi semi                            { StmtFor $1 (LitBool True) [] }
+          | semi Expression semi SimpleStmt                 { StmtFor [] $2 $4 }
+          | semi Expression semi                            { StmtFor [] $2 [] }
+          | semi semi SimpleStmt                            { StmtFor [] (LitBool True) $3 }
+          | semi semi                                       { StmtFor [] (LitBool True) [] }
 
 
 ReturnStmt :: { [Statement] }
@@ -432,11 +439,15 @@ Conversion :: { Expr }
 Conversion : Type OP Expression CP              { Conversion $1 $3 }
 
 BuiltinCall :: { Expr }
-BuiltinCall : ident OP CP                       { BuiltinCall $1 Nothing [] }
-            | ident OP Type CP                  { BuiltinCall $1 (Just $3) [] }
-            | ident OP Type ExpressionList CP   { BuiltinCall $1 (Just $3) (reverse $4) }
-            | ident OP ExpressionList CP        { BuiltinCall $1 Nothing (reverse $3) }
+BuiltinCall : BuiltinName OP CP                       { BuiltinCall $1 Nothing [] }
+            | BuiltinName OP Type CP                  { BuiltinCall $1 (Just $3) [] }
+            | BuiltinName OP Type ExpressionList CP   { BuiltinCall $1 (Just $3) (reverse $4) }
+            | BuiltinName OP ExpressionList CP        { BuiltinCall $1 Nothing (reverse $3) }
 
+BuiltinName :: { Token }
+BuiltinName : new       { $1 }
+            | delete    { $1 }
+            | panic     { $1 }
 
 Expression :: { Expr }
 Expression : BinaryExpr                         { $1 }
@@ -515,14 +526,13 @@ data Statement = StmtTypeDecl String Type
                | StmtShortVarDecl String Expr
                | StmtFunction String [(String, Type)] Type (Maybe [Statement])
                | StmtLabel String
-               | StmtEmpty
                | StmtExpr Expr
                | StmtInc Expr
                | StmtDec Expr
                | StmtAssignment (Maybe String) Expr Expr -- the string is an operand, or Nothing for basic assignment
-               | StmtIf Statement Expr [Statement] [Statement] -- the initializer, condition, block and else block. (the else block contains a single StmtIf, for an "else if")
-               | StmtFor Statement Expr Statement [Statement] -- initializer, condition, increment, block
-               | StmtSwitch Statement Expr [([Expr], [Statement])] -- initializer, switching variable (can be omitted, then equiv to "true". parser fills this in),
+               | StmtIf [Statement] Expr [Statement] [Statement] -- the initializer, condition, block and else block. (the else block contains a single StmtIf, for an "else if")
+               | StmtFor [Statement] Expr [Statement] [Statement] -- initializer, condition, increment, block
+               | StmtSwitch [Statement] Expr [([Expr], [Statement])] -- initializer, switching variable (can be omitted, then equiv to "true". parser fills this in),
                                                                    -- list of cases (comma-separated list of expr values, and bodies), default is empty Expr list.
                | StmtReturn (Maybe Expr)
                | StmtBreak String -- label
@@ -540,7 +550,7 @@ data Expr = LitInt Int
           | Selector Expr String
           | Index Expr Expr -- array expression and index expression
           | Call Expr [Expr] -- function expression and argument expressions
-          | BuiltinCall String (Maybe Type) [Expr] -- name of builtin, maybe a type as the first arg, and a list of parameter expressions
+          | BuiltinCall Token (Maybe Type) [Expr] -- token of builtin, maybe a type as the first arg, and a list of parameter expressions
           | Conversion Type Expr
           | UnOp Token Expr -- unary operator and expression
           | BinOp Token Expr Expr -- binary operator and operands
