@@ -26,7 +26,8 @@ $charesc = [abfnrtv\\] -- backslashable characters, except for quotes
 tokens :-
 
 $blank+ ; -- ignore non-newline whitespace
-\n | \; { const LEOL }
+\n { const LNewline }
+\; { const LSemi }
 
 -- comments to be ignored
 \/\/.* ;
@@ -58,6 +59,7 @@ defer       { keyword LDefer }
 else        { keyword LElse }
 fallthrough { keyword LFallthrough }
 for         { keyword LFor }
+func        { keyword LFunc }
 go          { keyword LGo }
 goto        { keyword LGoto }
 if          { keyword LIf }
@@ -92,12 +94,14 @@ var         { keyword LVar }
 
 ":" { (const LColon) }
 "." { (const LDot) }
+"," { (const LComma) }
 
 eof { (const LEOF) }
 
 {
 
-data Token = LEOL
+data Token = LNewline
+           | LSemi
            | LEOF
            | LIdent String
            | LInt Int
@@ -114,6 +118,7 @@ data Token = LEOL
            | LElse
            | LFallthrough
            | LFor
+           | LFunc
            | LGo
            | LGoto
            | LIf
@@ -137,6 +142,7 @@ data Token = LEOL
            | LCloseSB
            | LColon
            | LDot
+           | LComma
     deriving (Show)
 
 
