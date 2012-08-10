@@ -1,4 +1,5 @@
 .*.swp
 *.o
-Alex.hs
-Happy.hs
+*.hi
+Parser.hs
+GoLexer.hs
