@@ -92,7 +92,7 @@ import GoLexer
 %%
 
 SourceFile :: { SourceFile }
-           : PackageClause semi ImportDecls TopLevelDecls        { SourceFile $1 (reverse $3) (reverse $4) }
+           : PackageClause eol Blanks ImportDecls Blanks TopLevelDecls        { SourceFile $1 (reverse $4) (reverse $6) }
 
 PackageClause :: { String }
 PackageClause : package ident       { $2 }
@@ -118,6 +118,10 @@ ImportSpec : dot stringlit                  { Import Nothing $2 }
 eol :: { Token }
 eol : semi      { $1 }
     | newline   { $1 }
+
+Blanks :: { () }
+Blanks : Blanks eol     { () }
+       | {- empty -}    { () }
 
 QualifiedIdent :: { QualIdent }
 QualifiedIdent : ident dot ident    { QualIdent (Just $1) $3 }
@@ -555,9 +559,5 @@ data Key = KeyNone | KeyName String | KeyIndex Expr
     deriving (Show)
 
 parseError s = error $ "Parse error: " ++ show s
-
-main = do
-    inStr <- getContents
-    print $ parseGo $ alexScanTokens inStr
 
 }

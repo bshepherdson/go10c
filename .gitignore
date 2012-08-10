@@ -3,3 +3,4 @@
 *.hi
 Parser.hs
 GoLexer.hs
+go10cc
