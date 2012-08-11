@@ -1,6 +1,6 @@
 .*.swp
 *.o
 *.hi
-Parser.hs
+GoParser.hs
 GoLexer.hs
 go10cc

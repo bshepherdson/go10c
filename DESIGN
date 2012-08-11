@@ -13,6 +13,7 @@ Things handled differently from standard Go:
 * Go functions can have named return values, and multiple return values. Neither of these is supported.
 * Go functions will have a label with their name and package basename, thus: _package_function. Internal label names will be globally unique and unpredictable. Using them in any way other than the compiler does is undefined.
 * `new(T)` is reappropriated to create a new value of the given type `T` on the heap, which is *not* garbage collected.
+    * `new([]T, n)` creates a new array with elements of type `T` and length `n`.
 * `delete(x)` frees the value `x` which was previously created with `new()`. This is not the same meaning as standard Go `delete()`.The behavior when `free()`ing something that was not allocated with `new()`, or has already been freed, is undefined. Nasal demons.
 * `panic()` calls the DCPU-16 `HCF` "halt and catch fire" instruction.
 * Methods, interfaces, closures, function pointers, slices, maps, and all concurrency constructs are left out for now. Possibly in a future version. I realize this is all the interesting bits, but so be it.

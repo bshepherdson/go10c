@@ -1,5 +1,5 @@
 {
-module Parser where
+module GoParser where
 
 import GoLexer
 }
@@ -117,6 +117,7 @@ ImportSpecs : ImportSpecs eol ImportSpec    { $3 : $1 }
 ImportSpec :: { Import }
 ImportSpec : dot stringlit                  { Import Nothing $2 }
            | ident stringlit                { Import (Just $1) $2 }
+           | stringlit                      { Import Nothing $1 }
 
 
 eol :: { Token }
@@ -514,6 +515,10 @@ UnaryOp : '+'   { $1 }
 {
 
 data Type = TypeName QualIdent
+          | TypeBool
+          | TypeChar
+          | TypeInt
+          | TypeString
           | TypeArray Type
           | TypeStruct [(String, Type)] -- a struct with its parameters and their types.
           | TypePointer Type
@@ -557,7 +562,12 @@ data Expr = LitInt Int
   deriving (Show)
 
 data QualIdent = QualIdent { package :: Maybe String, name :: String }
-  deriving (Show, Eq)
+  deriving (Eq, Ord)
+
+instance Show QualIdent where
+    show (QualIdent (Just p) i) = p ++ "." ++ i
+    show (QualIdent Nothing i)  = i
+
 
 data SourceFile = SourceFile String [Import] [Statement]
     deriving (Show)
