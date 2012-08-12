@@ -518,6 +518,7 @@ data Type = TypeName QualIdent
           | TypeBool
           | TypeChar
           | TypeInt
+          | TypeUint
           | TypeString
           | TypeArray Type
           | TypeStruct [(String, Type)] -- a struct with its parameters and their types.

@@ -13,6 +13,7 @@ import Control.Arrow (first)
 
 import qualified Data.Map as M
 import Data.Maybe (isJust, isNothing)
+import Data.Char (ord)
 
 -- alright, thoughts:
 -- * need a symbol table to hold things we know about.
@@ -272,6 +273,30 @@ typeCheckEqOp op left right = do
     return TypeBool
 
 
+
+-- returns the size in words of a given type.
+-- int, uint, bool and char are all 1 word. pointers, including strings and arrays, are also 1 word.
+-- structs are the sum of the sizes of their fields
+typeSize :: Type -> Compiler Int
+typeSize TypeBool = return 1
+typeSize TypeInt  = return 1
+typeSize TypeUint = return 1
+typeSize TypeChar = return 1
+typeSize TypeString = return 1
+typeSize (TypePointer _) = return 1
+typeSize (TypeArray _) = return 1
+typeSize TypeVoid = error "Void type has no size."
+typeSize (TypeStruct fields) = sum <$> mapM (typeSize.snd) fields
+
+
+isPointer :: Type -> Bool
+isPointer (TypePointer _) = True
+isPointer _ = False
+
+isArray :: Type -> Bool
+isArray (TypeArray _) = True
+isArray _ = False
+
 -- return True if the first type can be converted into the second.
 -- a value x of type V is convertible to a type T in any of the following cases:
 -- * V is assignable to T
@@ -526,15 +551,15 @@ compileLocation (Label s) = return $ "[" ++ s ++ "]"
 
 -- compiles an expression, storing the result in the given register.
 compileExpr :: Expr -> String -> Compiler [String]
-compileExpr (LitInt n) r = return ["SET " ++ r ++ ", " ++ show n
-compileExpr (LitBool b) r = return ["SET " ++ r ++ ", " ++ if b then "1" else "0"]
-compileExpr (LitChar c) r = return ["SET " ++ r ++ ", " ++ ord c]
+compileExpr (LitInt n) r = return ["SET " ++ r ++ ", " ++ show n]
+compileExpr (LitBool b) r = return ["SET " ++ r ++ ", " ++ (if b then "1" else "0")]
+compileExpr (LitChar c) r = return ["SET " ++ r ++ ", " ++ show (ord c)]
 compileExpr (LitString s) r = do
     unique <- uniqueLabel
     modify $ \st -> st { strings = (unique, s) : strings st }
     return ["SET " ++ r ++ ", " ++ unique]
 
-compileExpr (LitComposite _) _ = error "Composite literals not implemented"
+compileExpr (LitComposite _ _) _ = error "Composite literals not implemented"
 
 compileExpr (Var i) r = do
     loc <- lookupLocation i >>= compileLocation
@@ -557,8 +582,8 @@ compileExpr (Call (Var f) args) r = do
     when (length args >= 4) $ error "Functions with more than 3 arguments are not implemented."
     (saveCode, restoreCode) <- saveRegsForCall r
 
-    argCode <- concat <$> mapM (fmap concat . mapM (uncurry compileExpr)) (zip args ["A", "B", "C"])
-    let jsrCode = ["JSR " ++ mkLabel f]
+    argCode <- concat <$> sequence (zipWith compileExpr args ["A", "B", "C"])
+    let jsrCode = ["JSR " ++ mkLabel (name f)]
         returnCode = ["SET " ++ r ++ ", A"]
 
     return $ saveCode ++ argCode ++ jsrCode ++ returnCode ++ restoreCode
@@ -569,9 +594,11 @@ compileExpr (Call _ _) _ = error "Function pointers are not supported, the funct
 compileExpr (BuiltinCall LNew (Just (TypeArray t)) (n:_)) r = do
     (saveCode, restoreCode) <- saveRegsForCall r
     size <- typeSize t
-    return $ saveCode ++
-             ["SET A, " ++ show (n*size),
-              "JSR heap.alloc"] ++ -- pointer is stored in A
+    lengthCode <- compileExpr n r
+    return $ saveCode ++ lengthCode ++
+             ["SET A, " ++ show size,
+              "MUL A, " ++ r,         -- size in words
+              "JSR heap.alloc"] ++    -- pointer is stored in A
              (if r /= "A" then ["SET " ++ r ++ ", A"] else []) ++
              restoreCode
 
@@ -589,9 +616,8 @@ compileExpr (BuiltinCall LNew _ _) _ = compileError "new() called with no type a
 compileExpr (BuiltinCall LDelete Nothing [x]) _ = do
     (saveCode, restoreCode) <- saveRegsForCall "_" -- placeholder
     -- the type has already been checked, so just call it.
-    expCode <- compileExpression x "A"
+    expCode <- compileExpr x "A"
     return $ saveCode ++ expCode ++ ["JSR heap.free"] ++ restoreCode
-
 
 
 
