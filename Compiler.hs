@@ -449,12 +449,51 @@ compile (StmtIf initializer condition ifbody elsebody) = do
 
 
 
-{-
 compile (StmtFor initializer condition incrementer body) = do
     ct <- typeCheck condition
-    when (ct /= TypeBool
-               | StmtFor [Statement] Expr [Statement] [Statement] -- initializer, condition, increment, block
-               -}
+    when (ct /= TypeBool) $ typeError $ "Loop condition must have type bool, found " ++ show ct
+
+    prefix <- uniqueLabel
+
+    -- add the new scope before the initializer
+    modify $ \s -> s { symbols = M.empty : symbols s }
+
+    initCode <- concat <$> mapM compile initializer
+    let topLabelCode = [":" ++ prefix ++ "_top"]
+
+    r <- getReg
+    condCode <- compileExpr condition r
+    let condCheckCode = ["IFE " ++ r ++ ", 0", "SET PC, " ++ prefix ++ "_end"]
+    freeReg r
+
+    bodyCode <- concat <$> mapM compile body
+    incCode <- concat <$> mapM compile incrementer
+
+    let topJumpCode = ["SET PC, " ++ prefix ++ "_top"]
+
+    let endLabelCode = [":" ++ prefix ++ "_end"]
+
+    modify $ \s -> s { symbols = tail (symbols s) } -- remove the new loop scope.
+
+    return $ initCode ++ topLabelCode ++ condCode ++ condCheckCode ++ bodyCode ++ incCode ++ topJumpCode ++ endLabelCode
+
+
+compile (StmtReturn mx) = do
+    exprCode <- case mx of
+        Nothing -> return []
+        Just x  -> do
+            r <- getReg
+            code <- compileExpr x r
+            freeReg r
+            return $ code ++ ["SET A, " ++ r]
+    t <- gets this
+    return $ exprCode ++ ["SET PC, " ++ t ++ "_done"]
+
+
+compile (StmtGoto label) = return ["SET PC, " ++ label]
+
+compile _ = compileError "Not implemented"
+
 
 compileIncDec :: String -> Expr -> Compiler [String]
 compileIncDec opcode (Var i) = do
