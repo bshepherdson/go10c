@@ -178,10 +178,21 @@ typeCheck (Call f args) = do
                 ((expected, actual):_) -> typeError $ "Function call expected an argument of type " ++ show expected ++ " but got " ++ show actual ++ "."
         _ -> typeError $ "Attempt to call a non-function value " ++ show f ++ " of type " ++ show ft
 
-typeCheck (BuiltinCall LNew (Just (TypeArray t)) _) = return (TypeArray t) -- arrays are already pointers, we don't need to create a pointer to them.
+typeCheck (BuiltinCall LNew (Just (TypeArray t)) [n]) = do
+    nt <- typeCheck n
+    nut <- underlyingType nt
+    when (nut /= TypeInt) $ typeError $ "new() called to create an array type with non-int size of type " ++ show nt
+    return (TypeArray t) -- arrays are already pointers, we don't need to create a pointer to them.
+
+typeCheck (BuiltinCall LNew (Just (TypeArray t)) _) = typeError $ "new() called to create an array but no size was provided"
 typeCheck (BuiltinCall LNew (Just t) _) = return (TypePointer t) -- otherwise create a pointer to the provided type (TODO does this work for strings?)
 typeCheck (BuiltinCall LNew Nothing _)  = typeError $ "new() must have a type provided as the first argument."
-typeCheck (BuiltinCall LDelete Nothing [x]) = return TypeVoid -- delete returns nothing
+typeCheck (BuiltinCall LDelete Nothing [x]) = do
+    t <- typeCheck x
+    ut <- underlyingType t
+    when (not (isPointer ut) && not (isArray ut)) $ typeError $ "delete() called with a value that is neither a pointer nor an array. It has type " ++ show t
+    return TypeVoid -- delete returns nothing.
+
 typeCheck (BuiltinCall LDelete Nothing _)   = typeError $ "delete() must have an argument provided"
 typeCheck (BuiltinCall LPanic _ _) = return TypeVoid -- panic ignores its arguments and HCFs
 typeCheck (Conversion t x) = do
@@ -513,7 +524,94 @@ compileLocation (Stack n) = return $ "PICK " ++ show n
 compileLocation (Label s) = return $ "[" ++ s ++ "]"
 
 
-compileExpr = undefined
+-- compiles an expression, storing the result in the given register.
+compileExpr :: Expr -> String -> Compiler [String]
+compileExpr (LitInt n) r = return ["SET " ++ r ++ ", " ++ show n
+compileExpr (LitBool b) r = return ["SET " ++ r ++ ", " ++ if b then "1" else "0"]
+compileExpr (LitChar c) r = return ["SET " ++ r ++ ", " ++ ord c]
+compileExpr (LitString s) r = do
+    unique <- uniqueLabel
+    modify $ \st -> st { strings = (unique, s) : strings st }
+    return ["SET " ++ r ++ ", " ++ unique]
+
+compileExpr (LitComposite _) _ = error "Composite literals not implemented"
+
+compileExpr (Var i) r = do
+    loc <- lookupLocation i >>= compileLocation
+    return ["SET " ++ r ++ ", " ++ loc]
+
+compileExpr (Selector _ _) _ = error "Selectors not implemented"
+
+compileExpr (Index arr ix) r = do
+    arrType <- typeCheck arr
+    size <- typeSize arrType
+    arrCode <- compileExpr arr r
+    ixR <- getReg
+    ixCode <- compileExpr ix ixR
+    freeReg ixR
+    return $ arrCode ++ ixCode ++ 
+             (if size > 1 then ["MUL " ++ ixR ++ ", " ++ show size] else []) ++ -- if the size of the array elements is > 1, multiply from the index to the offset. TODO optimization trivial: shift for sizes that are powers of 2.
+             ["ADD " ++ r ++ ", " ++ ixR, "SET " ++ r ++ ", [" ++ r ++ "]"]
+
+compileExpr (Call (Var f) args) r = do
+    when (length args >= 4) $ error "Functions with more than 3 arguments are not implemented."
+    (saveCode, restoreCode) <- saveRegsForCall r
+
+    argCode <- concat <$> mapM (fmap concat . mapM (uncurry compileExpr)) (zip args ["A", "B", "C"])
+    let jsrCode = ["JSR " ++ mkLabel f]
+        returnCode = ["SET " ++ r ++ ", A"]
+
+    return $ saveCode ++ argCode ++ jsrCode ++ returnCode ++ restoreCode
+
+compileExpr (Call _ _) _ = error "Function pointers are not supported, the function used in a call must be an identifier."
+
+-- creating an array with a length
+compileExpr (BuiltinCall LNew (Just (TypeArray t)) (n:_)) r = do
+    (saveCode, restoreCode) <- saveRegsForCall r
+    size <- typeSize t
+    return $ saveCode ++
+             ["SET A, " ++ show (n*size),
+              "JSR heap.alloc"] ++ -- pointer is stored in A
+             (if r /= "A" then ["SET " ++ r ++ ", A"] else []) ++
+             restoreCode
+
+compileExpr (BuiltinCall LNew (Just t) _) r = do
+    (saveCode, restoreCode) <- saveRegsForCall r
+    size <- typeSize t
+    return $ saveCode ++
+             ["SET A, " ++ show size,
+              "JSR heap.alloc"] ++ -- pointer is stored in A
+             (if r /= "A" then ["SET " ++ r ++ ", A"] else []) ++
+             restoreCode
+
+compileExpr (BuiltinCall LNew _ _) _ = compileError "new() called with no type as an argument"
+
+compileExpr (BuiltinCall LDelete Nothing [x]) _ = do
+    (saveCode, restoreCode) <- saveRegsForCall "_" -- placeholder
+    -- the type has already been checked, so just call it.
+    expCode <- compileExpression x "A"
+    return $ saveCode ++ expCode ++ ["JSR heap.free"] ++ restoreCode
+
+
+
+
+
+-- returns the registers to be saved before making a function call.
+-- saves A, B, and C, unless they are unused or the ultimate target for the return value.
+regsToSave :: String -> Compiler [String]
+regsToSave r = do
+    free <- gets freeRegs
+    -- so we need to save: all registers A, B, C that are in use, since the function may clobber them, but we shouldn't save one that is the target register for the return
+    return $ filter (not . (`elem` (r:free))) ["A", "B", "C"]
+
+-- given the register target for this expression, returns code to save the necessary subset of A, B and C before a call, and restore them afterward
+saveRegsForCall :: String -> Compiler ([String], [String])
+saveRegsForCall r = do
+    rs <- regsToSave r
+    return (map ("SET PUSH, " ++) rs,
+            map (\r -> "SET " ++ r ++ ", POP") (reverse rs))
+
+
 
 isLvalue :: Expr -> Bool
 isLvalue (Var _) = True
@@ -534,26 +632,6 @@ data Type = TypeName QualIdent
           | TypeFunction [Type] Type -- a function giving its argument types and (singular, in my Go) return type.
           | TypeVoid -- nonexistent type used for functions without return values
   deriving (Eq, Show)
-
-data Statement = StmtTypeDecl String Type
-               | StmtVarDecl String Type (Maybe Expr)
-               | StmtShortVarDecl String Expr
-               | StmtFunction String [(String, Type)] Type (Maybe [Statement])
-               | StmtLabel String
-               | StmtExpr Expr
-               | StmtInc Expr
-               | StmtDec Expr
-               | StmtAssignment (Maybe String) Expr Expr -- the string is an operand, or Nothing for basic assignment
-               | StmtIf [Statement] Expr [Statement] [Statement] -- the initializer, condition, block and else block. (the else block contains a single StmtIf, for an "else if")
-               | StmtFor [Statement] Expr [Statement] [Statement] -- initializer, condition, increment, block
-               | StmtSwitch [Statement] Expr [([Expr], [Statement])] -- initializer, switching variable (can be omitted, then equiv to "true". parser fills this in),
-                                                                   -- list of cases (comma-separated list of expr values, and bodies), default is empty Expr list.
-               | StmtReturn (Maybe Expr)
-               | StmtBreak String -- label
-               | StmtContinue String -- label
-               | StmtGoto String -- label
-               | StmtFallthrough
-  deriving (Show)
 
 data Expr = LitInt Int
           | LitBool Bool
