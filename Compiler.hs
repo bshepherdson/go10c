@@ -9,9 +9,10 @@ import Control.Monad
 import Control.Monad.State.Strict
 
 import Control.Applicative
+import Control.Arrow (first)
 
 import qualified Data.Map as M
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 
 -- alright, thoughts:
 -- * need a symbol table to hold things we know about.
@@ -40,17 +41,26 @@ type SymbolTable = M.Map QualIdent Type
 
 data CompilerState = CS {
      symbols :: [SymbolTable]
-    ,dirtyRegs :: [Char] -- registers that have been dirtied in a function and need cleaning up.
-    ,usedRegs :: [Char] -- registers that are currently in use and can't be used now.
+    ,dirtyRegs :: [String] -- registers that have been dirtied in a function and need cleaning up.
+    ,freeRegs :: [String] -- registers that are currently in use and can't be used now.
     ,strings :: [(String,String)] -- a collection of string literals to be written into the binary. pairs are (symbol name, content).
     ,types :: SymbolTable
+    ,args :: [(QualIdent, Location)] -- a list of argument names and their locations.
+    ,locals :: [(QualIdent, Location)] --  a list of local variables and their locations.
+    ,globals :: [(QualIdent, Location)] -- a list of global variables and their locations.
+    ,this :: String -- the name of the function currently being compiled, used for labels.
+    ,unique :: Int -- an incrementing number to allow the construction of globally unique labels.
     }
+
+data Location = Reg String
+              | Stack Int -- places above the stack pointer
+              | Label String -- in the given label
 
 
 newtype Compiler a = Compiler (StateT CompilerState IO a)
     deriving (Functor, Applicative, Monad, MonadState CompilerState, MonadIO)
 
-emptyCS = CS [] [] [] [] M.empty
+emptyCS = CS [] [] [] [] M.empty [] [] []
 
 runCompiler :: Compiler a -> CompilerState -> IO a
 runCompiler (Compiler a) s = fst <$> runStateT a s
@@ -74,6 +84,61 @@ maybeLookupSymbol i = do
         _     -> return Nothing
 
 
+-- Looks up the location where a variable is stored. Locals trump args trump globals.
+lookupLocation :: QualIdent -> Compiler Location
+lookupLocation i = do
+    s <- get
+    let res = map (lookup i) [locals s, args s, globals s]
+    case dropWhile isNothing res of
+        [] -> error $ "Could not find a storage location for the variable " ++ show i
+        (Just loc:_) -> return loc
+
+
+-- Adds a symbol to the innermost scope.
+addSymbol :: QualIdent -> Type -> Compiler ()
+addSymbol i t = modify $ \s -> s { symbols = (M.insert i t (head (symbols s))) : tail (symbols s) }
+
+
+-- Does a deep search to find all the local variables in a list of statements.
+findLocals :: [Statement] -> [QualIdent]
+findLocals [] = []
+findLocals (StmtVarDecl i _ _ : rest) = QualIdent Nothing i : findLocals rest
+findLocals (StmtShortVarDecl i _ : rest) = QualIdent Nothing i : findLocals rest
+findLocals (_:rest) = findLocals rest
+
+
+-- returns a free register to be used in an expression.
+getReg :: Compiler String
+getReg = do
+    rs <- gets freeRegs
+    ds <- gets dirtyRegs
+    case rs of
+        [] -> error "Internal compiler error: Ran out of registers to allocate"
+        (r:rest) -> do
+            case filter (==r) ds of
+                [] -> modify $ \s -> s { dirtyRegs = r : ds, freeRegs = rest }
+                _  -> modify $ \s -> s { freeRegs = rest }
+            return r
+
+
+freeReg :: String -> Compiler ()
+freeReg r = modify $ \s -> s { freeRegs = r : freeRegs s }
+
+
+-- turns a function name into a compiler label
+mkLabel :: String -> String
+mkLabel s = "_go10c_" ++ s
+
+
+uniqueLabel :: Compiler String
+uniqueLabel = do
+    s <- get
+    let label = this s ++ "_" ++ show (unique s)
+    put s { unique = unique s + 1 }
+    return label
+
+
+compileError = error
 typeError = error
 
 -- typechecks an expression, returning its Type or printing a type error and exiting.
@@ -249,6 +314,249 @@ lookupType i = do
     case M.lookup i ts of
         Nothing -> typeError $ "Unknown named type: " ++ show i
         Just t  -> return t
+
+
+-- Compiles a Statement into a string of assembly code to perform it.
+-- Should not add symbols to the table on a TypeDecl or VarDecl. They should have been added by the scan performed when beginning a block/file.
+-- Initializers for variables should still be compiled in place (because they might depend on the values of other variables).
+compile :: Statement -> Compiler [String]
+compile (StmtTypeDecl name t) = error "TypeDecls are not to be compiled."
+
+-- note that this doesn't add the symbol, but rather expects it to already exist. this does compile initializers, though.
+compile (StmtVarDecl name t Nothing) = addSymbol (QualIdent Nothing name) t >> return [] -- nothing to do for a plain declaration
+compile (StmtVarDecl name t (Just x)) = addSymbol (QualIdent Nothing name) t >> setVar (QualIdent Nothing name) x
+compile (StmtShortVarDecl name x) = do
+    t <- typeCheck x
+    addSymbol (QualIdent Nothing name) t
+    setVar (QualIdent Nothing name) x
+compile (StmtFunction _ _ _ Nothing) = return []
+compile (StmtFunction name args ret (Just body)) = do
+    -- so a function. we need a new scope pushed, as well as a new set of locations for local variables and arguments.
+    -- here's how the base pointer is handled. we use J as a base pointer. it points at the first local.
+    -- the locals are at J+0, J+1, J+2, etc. the old value of J is stored at J+n, and any stack-passed args are in J+n+1, J+n+2, ...
+    -- first, harvest the locals from the function body.
+    addSymbol (QualIdent Nothing name) (TypeFunction (map snd args) ret) -- add the function to the symbol table before we grab the state, to allow recursion.
+    s <- get
+    let allLocals = findLocals body -- [(QualIdent, Type)]
+        localCount = length allLocals
+        argLocations = [Reg "A", Reg "B", Reg "C"] ++ map Stack [localCount+2..] -- they're deeper than the locals, and the first three are in registers. +1 because the old PC return address is stored on top of them, and the base pointer is stored on top of that.
+        myArgs = zip (map (QualIdent Nothing . fst) args) argLocations -- [(QualIdent, Location)], as necessary
+        myLocalLocations = zip allLocals $ map Stack [0..]
+        mySymbols = M.fromList $ map (first (QualIdent Nothing)) args -- locals are not included in the symbol table, they'll be added as their definitions pass by.
+        s' = s {
+            locals = myLocalLocations,
+            args = myArgs,
+            dirtyRegs = [],
+            freeRegs = drop (min 3 (length args)) ["A", "B", "C", "X", "Y", "Z", "I"],
+            symbols = mySymbols : symbols s,
+            this = name }
+
+        prefix = mkLabel name
+
+    put s'
+
+    bodyCode <- concat <$> mapM compile body
+
+    s'' <- get
+
+    -- add preamble and postamble, saving and restoring the dirty registers and quitting.
+    let preambleCode  = [":" ++ prefix,
+                         "SET PUSH, J",                     -- store the old value of J, the base pointer.
+                         "SUB SP, " ++ show localCount,     -- make room for the locals
+                         "SET J, SP"] ++                    -- and set J to be the new base pointer, pointing at the first local.
+                        map ("SET PUSH, " ++) (dirtyRegs s'')
+        postambleCode = [":" ++ prefix ++ "_done"] ++
+                        map (\r -> "SET " ++ r ++ ", POP") (reverse (dirtyRegs s'')) ++
+                        ["ADD SP, " ++ show localCount,     -- remove the locals
+                         "SET J, POP",                      -- restore the old base pointer.
+                         "SET PC, POP"]                     -- and return
+
+    put s -- restore the original state, removing my locals, args and symbols.
+    return $ preambleCode ++ bodyCode ++ postambleCode
+
+
+compile (StmtLabel s) = return [":" ++ s] -- this isn't easy to do re: labeled jumps and breaks and crap. maybe make this a container instead of an ordinary statement.
+
+compile (StmtExpr x@(Call _ _)) = do
+    r <- getReg
+    code <- compileExpr x r
+    freeReg r
+    return code
+compile (StmtExpr x@(BuiltinCall _ _ _)) = do
+    r <- getReg
+    code <- compileExpr x r
+    freeReg r
+    return code
+compile (StmtExpr x) = error $ "Suspicious code. Expression " ++ show x ++ " has no side effects."
+
+compile (StmtInc x) = compileIncDec "ADD " x
+compile (StmtDec x) = compileIncDec "SUB " x
+
+compile (StmtAssignment Nothing lvalue rvalue) = do
+    when (not $ isLvalue lvalue) $ compileError $ "Attempt to assign to non-lvalue " ++ show lvalue
+    lt <- typeCheck lvalue
+    rt <- typeCheck rvalue
+    assign <- assignable rt lt
+    when (not $ assign) $ typeError $ "Right side of assignment is not assignable to left side.\n\tLeft: " ++ show lt ++ "\n\tRight: " ++ show rt
+
+    -- if we get down here, then this assignment is legal, so compile it.
+    r <- getReg
+    exprCode <- compileExpr rvalue r
+    case lvalue of
+        (Var i) -> do
+            locCode <- lookupLocation i >>= compileLocation
+            return $ exprCode ++ ["SET " ++ locCode ++ ", " ++ r]
+        _ -> error "Not implemented: Assigning to lvalues other than straight variables." -- TODO implement
+
+-- TODO: Optimization: some ops, like += and -=, can be optimized by using ADD instead of computing and setting. Priority low, though, only a couple of instructions wasted.
+compile (StmtAssignment (Just op) lvalue rvalue) = compile (StmtAssignment Nothing lvalue (BinOp (LOp op) lvalue rvalue))
+
+
+compile (StmtIf initializer condition ifbody elsebody) = do
+    -- the anatomy of an if-statement:
+    -- it begins with the initializer. then the condition is computed. a jump is compiled that if the condition is false jumps to the beginning of the else block or the end
+    -- at the end of the body a jump to the end is computed to skip over the else block.
+    -- or is it easier to go in reverse?
+
+    ct <- typeCheck condition
+    when (ct /= TypeBool) $ typeError $ "Condition of an if statement must have type bool, found " ++ show ct
+
+    -- push the new scope before compiling the initializer, since any variables it defines are scoped in the if.
+    modify $ \s -> s { symbols = M.empty : symbols s }
+    initCode <- concat <$> mapM compile initializer
+    r <- getReg
+    condCode <- compileExpr condition r
+
+    -- get a label prefix for this if, set 'this' appropriately.
+    prefix <- uniqueLabel
+    let jumpCode = ["IFE " ++ r ++ ", 0",
+                    "SET PC, " ++ if null elsebody then prefix ++ "_endif" else prefix ++ "_else"] -- jump if the condition is false, since we're jumping to the else block.
+    freeReg r -- don't need this reserved anymore, because the jump is now compiled.
+    ifCode <- concat <$> mapM compile ifbody
+    let ifJumpCode = if null elsebody then [] else ["SET PC, " ++ prefix ++ "_endif"] -- add a jump to the end of the if body if there's an else to jump over.
+
+    elseCode <- case elsebody of
+        [] -> return []
+        _  -> do
+            elseCode <- concat <$> mapM compile elsebody
+            return $ [":" ++ prefix ++ "_else"] ++ elseCode
+
+    -- TODO I think variables declared in any part of the if are spreading to the rest of it. Mostly harmless.
+    -- remove the scope
+    modify $ \s -> s { symbols = tail (symbols s) }
+
+    return $ initCode ++ condCode ++ jumpCode ++ ifCode ++ ifJumpCode ++ elseCode ++ [":" ++ prefix ++ "_endif"]
+
+
+
+{-
+compile (StmtFor initializer condition incrementer body) = do
+    ct <- typeCheck condition
+    when (ct /= TypeBool
+               | StmtFor [Statement] Expr [Statement] [Statement] -- initializer, condition, increment, block
+               -}
+
+compileIncDec :: String -> Expr -> Compiler [String]
+compileIncDec opcode (Var i) = do
+    xt <- typeCheck (Var i)
+    xut <- underlyingType xt
+    case xut of
+        TypeInt -> do
+            locCode <- lookupLocation i >>= compileLocation
+            return [opcode ++ locCode ++ ", 1"]
+        _ -> typeError $ "Attempt to ++ or -- non-int type " ++ show xt
+
+
+-- turns a Location into the assembly string representing it
+compileLocation :: Location -> Compiler String
+compileLocation (Reg r) = return r
+compileLocation (Stack n) = return $ "PICK " ++ show n
+compileLocation (Label s) = return $ "[" ++ s ++ "]"
+
+
+compileExpr = undefined
+
+isLvalue :: Expr -> Bool
+isLvalue (Var _) = True
+isLvalue (Selector x _) = isLvalue x
+isLvalue (Index x _) = isLvalue x
+isLvalue _ = False
+
+
+{-
+data Type = TypeName QualIdent
+          | TypeBool
+          | TypeChar
+          | TypeInt
+          | TypeString
+          | TypeArray Type
+          | TypeStruct [(String, Type)] -- a struct with its parameters and their types.
+          | TypePointer Type
+          | TypeFunction [Type] Type -- a function giving its argument types and (singular, in my Go) return type.
+          | TypeVoid -- nonexistent type used for functions without return values
+  deriving (Eq, Show)
+
+data Statement = StmtTypeDecl String Type
+               | StmtVarDecl String Type (Maybe Expr)
+               | StmtShortVarDecl String Expr
+               | StmtFunction String [(String, Type)] Type (Maybe [Statement])
+               | StmtLabel String
+               | StmtExpr Expr
+               | StmtInc Expr
+               | StmtDec Expr
+               | StmtAssignment (Maybe String) Expr Expr -- the string is an operand, or Nothing for basic assignment
+               | StmtIf [Statement] Expr [Statement] [Statement] -- the initializer, condition, block and else block. (the else block contains a single StmtIf, for an "else if")
+               | StmtFor [Statement] Expr [Statement] [Statement] -- initializer, condition, increment, block
+               | StmtSwitch [Statement] Expr [([Expr], [Statement])] -- initializer, switching variable (can be omitted, then equiv to "true". parser fills this in),
+                                                                   -- list of cases (comma-separated list of expr values, and bodies), default is empty Expr list.
+               | StmtReturn (Maybe Expr)
+               | StmtBreak String -- label
+               | StmtContinue String -- label
+               | StmtGoto String -- label
+               | StmtFallthrough
+  deriving (Show)
+
+data Expr = LitInt Int
+          | LitBool Bool
+          | LitChar Char
+          | LitString String
+          | LitComposite Type [(Key, Expr)]
+          | Var QualIdent
+          | Selector Expr String
+          | Index Expr Expr -- array expression and index expression
+          | Call Expr [Expr] -- function expression and argument expressions
+          | BuiltinCall Token (Maybe Type) [Expr] -- token of builtin, maybe a type as the first arg, and a list of parameter expressions
+          | Conversion Type Expr
+          | UnOp Token Expr -- unary operator and expression
+          | BinOp Token Expr Expr -- binary operator and operands
+  deriving (Show)
+
+data QualIdent = QualIdent { package :: Maybe String, name :: String }
+  deriving (Eq, Ord)
+
+-}
+
+-- Sets the variable with the given name to the given expression, returns code to make it so (including computing the expression).
+setVar :: QualIdent -> Expr -> Compiler [String]
+setVar i x = do
+    -- First look up the variable's type and check against the type of the expression.
+    xt <- typeCheck x
+    t  <- lookupSymbol i
+    assign <- assignable xt t
+    when (not assign) $ typeError $ "Attempting to set the variable " ++ show i ++ " of type " ++ show t ++ " to incompatible type " ++ show xt
+    -- if we get to here then the type is assignable, so compute the expression's value
+    r <- getReg
+    exprCode <- compileExpr x r
+
+    -- location of the variable
+    loc <- lookupLocation i
+    storeCode <- case loc of
+        Reg s -> return ["SET " ++ s ++ ", " ++ r]
+        Stack n -> return ["SET PICK " ++ show n ++ ", " ++ r]
+        Label l -> return ["SET [" ++ l ++ "], " ++ r]
+
+    freeReg r
+    return $ exprCode ++ storeCode
 
 
 main = do
