@@ -302,7 +302,7 @@ isArray _ = False
 -- * V is assignable to T
 -- * V and T have the same underlying type
 -- * V and T are (unnamed) pointer types, and their pointer base types are convertible
--- * V is int or []char and T is string
+-- * V is []char and T is string
 -- * V is string and T is []char
 convertible :: Type -> Type -> Compiler Bool
 convertible l r = do
@@ -313,7 +313,7 @@ convertible l r = do
         (True, _, _, _) -> return True -- assignable
         (False, True, _, _) -> return True -- identical underlying types
         (_, _, TypePointer p1, TypePointer p2) -> convertible p1 p2
-        (_, _, TypeInt, TypeString) -> return True
+        --(_, _, TypeInt, TypeString) -> return True -- we don't support this one.
         (_, _, TypeArray TypeChar, TypeString) -> return True
         (_, _, TypePointer TypeChar, TypeString) -> return True
         (_, _, TypeString, TypeArray TypeChar) -> return True
@@ -619,8 +619,151 @@ compileExpr (BuiltinCall LDelete Nothing [x]) _ = do
     expCode <- compileExpr x "A"
     return $ saveCode ++ expCode ++ ["JSR heap.free"] ++ restoreCode
 
+compileExpr (BuiltinCall LDelete _ _) _ = typeError "delete() must be called with exactly one pointer."
+
+compileExpr (BuiltinCall LPanic _ _) _ = return ["HCF 0"]
 
 
+compileExpr (Conversion t x) r = do
+    xt <- typeCheck x
+    canConvert <- convertible xt t
+    when (not canConvert) $ typeError $ "Cannot convert from " ++ show xt ++ " to " ++ show t
+    -- convertible types don't require any actual changes, there's no change to perform.
+    compileExpr x r
+
+
+compileExpr (UnOp (LOp "+") x) r = compileExpr x r -- nothing to do for +
+compileExpr (UnOp (LOp "-") x) r = do
+    ut <- typeCheck x >>= underlyingType
+    when (ut /= TypeInt && ut /= TypeUint) $ typeError $ "Cannot negate non-(u)int value of type " ++ show ut
+    exprCode <- compileExpr x r
+    return $ exprCode ++ ["XOR " ++ r ++ ", 0xffff", "ADD " ++ r ++ ", 1"] -- 2s complement negation.
+
+compileExpr (UnOp (LOp "!") x) r = do
+    ut <- typeCheck x >>= underlyingType
+    when (ut /= TypeBool) $ typeError $ "Unary ! can only be applied to bool values."
+    exprCode <- compileExpr x r
+    return $ exprCode ++ ["XOR " ++ r ++ ", 1"] -- MUST have booleans as 0 and 1, not 0 and nonzero or 0 and 0xffff
+
+compileExpr (UnOp (LOp "^") x) r = do
+    ut <- typeCheck x >>= underlyingType
+    when (ut /= TypeInt && ut /= TypeUint) $ typeError $ "Unary ^ can only be applied to int and uint values."
+    exprCode <- compileExpr x r
+    return $ exprCode ++ ["XOR " ++ r ++ ", 0xffff"]
+
+compileExpr (UnOp (LOp "*") x) r = do
+    t <- typeCheck x
+    ut <- underlyingType t
+    when (not (isPointer ut)) $ typeError $ "Attempt to dereference non-pointer type " ++ show t
+    exprCode <- compileExpr x r
+    return $ exprCode ++ ["SET " ++ r ++ ", [" ++ r ++ "]"]
+
+compileExpr (UnOp (LOp "&") x) r = do
+    when (not (isLvalue x)) $ typeError $ "Cannot take address of non-variable expression."
+    case x of
+        (Var i) -> do
+            loc <- lookupLocation i
+            case loc of
+                Reg _ -> typeError $ "Attempt to take address of value contained in a register " ++ show i
+                Stack n -> return ["SET " ++ r ++ ", J", "ADD " ++ r ++ ", " ++ show n]
+        (Index x i) -> do
+            xt <- typeCheck x
+            xut <- underlyingType xt
+            when (not (isArray xut)) $ typeError $ "Attempt to index non-array value of type " ++ show xt
+            let (TypeArray elementType) = xut
+            it <- typeCheck i
+            iut <- underlyingType it
+            when (iut /= TypeInt && iut /= TypeUint) $ typeError $ "Index into array must be of integer type, but found " ++ show it
+
+            size <- typeSize elementType
+
+            xCode <- compileExpr x r
+            ir <- getReg
+            iCode <- compileExpr i ir
+            freeReg ir
+            return $ xCode ++ iCode ++
+                     (if size > 1 then ["MUL " ++ ir ++ ", " ++ show size] else []) ++
+                     ["ADD " ++ r ++ ", " ++ ir]
+        (Selector _ _) -> compileError $ "Struct selectors are not implemented."
+        x -> typeError "Cannot take the address of this value."
+
+
+compileExpr (BinOp (LOp "+") left right) r = compileIntegralBinOp "ADD" "ADD" "+" left right r
+compileExpr (BinOp (LOp "-") left right) r = compileIntegralBinOp "SUB" "SUB" "-" left right r
+compileExpr (BinOp (LOp "*") left right) r = compileIntegralBinOp "MUL" "MLI" "*" left right r
+compileExpr (BinOp (LOp "/") left right) r = compileIntegralBinOp "DIV" "DVI" "/" left right r
+compileExpr (BinOp (LOp "%") left right) r = compileIntegralBinOp "MOD" "MDI" "%" left right r
+compileExpr (BinOp (LOp "|") left right) r = compileIntegralBinOp "BOR" "BOR" "|" left right r
+compileExpr (BinOp (LOp "^") left right) r = compileIntegralBinOp "XOR" "XOR" "^" left right r
+compileExpr (BinOp (LOp "&") left right) r = compileIntegralBinOp "AND" "AND" "&" left right r
+compileExpr (BinOp (LOp "<<") left right) r = compileIntegralBinOp "SHL" "SHL" "<<" left right r
+compileExpr (BinOp (LOp ">>") left right) r = compileIntegralBinOp "SHR" "ASR" ">>" left right r
+
+compileExpr (BinOp (LOp "==") left right) r = compileEqBinOp "IFE" "==" left right r
+compileExpr (BinOp (LOp "!=") left right) r = compileEqBinOp "IFN" "!=" left right r
+
+compileExpr (BinOp (LOp ">") left right) r = compileComparisonOp "IFG" "IFA" ">" id left right r
+compileExpr (BinOp (LOp "<") left right) r = compileComparisonOp "IFL" "IFU" "<" id left right r
+compileExpr (BinOp (LOp ">=") left right) r = compileComparisonOp "IFL" "IFU" ">=" swap left right r -- >= is < with the arguments swapped
+compileExpr (BinOp (LOp "<=") left right) r = compileComparisonOp "IFG" "IFA" "<=" swap left right r -- <= is > with the arguments swapped
+
+
+-- helper function for integral type binary operations like +, -, | and <<
+compileIntegralBinOp :: String -> String -> String -> Expr -> Expr -> String -> Compiler [String]
+compileIntegralBinOp unsignedOp signedOp opName left right r = do
+    [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
+    op <- case (leftType, rightType) of
+        (TypeInt, TypeInt) -> return signedOp
+        (TypeUint, TypeUint) -> return unsignedOp
+        (TypeChar, TypeChar) -> return unsignedOp
+        _ -> typeError $ opName ++ " can only be used on matching integral or char types, not " ++ show leftType ++ " and " ++ show rightType
+
+    leftCode <- compileExpr left r
+    rr <- getReg
+    rightCode <- compileExpr right rr
+    freeReg rr
+    return $ leftCode ++ rightCode ++ [op ++ " " ++ r ++ ", " ++ r]
+
+
+compileEqBinOp :: String -> String -> Expr -> Expr -> String -> Compiler [String]
+compileEqBinOp opCode opName left right r = do
+    [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
+    when (leftType /= rightType) $ typeError $ opName ++ " can only be used on matching integral or char types, not " ++ show leftType ++ " and " ++ show rightType
+
+    leftCode <- compileExpr left r
+    rr <- getReg
+    rightCode <- compileExpr right rr
+    freeReg rr
+
+    return $ leftCode ++ rightCode ++
+            ["SET EX, 0",
+             opCode ++ " " ++ r ++ ", " ++ rr,
+             "SET EX, 1",
+             "SET " ++ r ++ ", EX"]
+
+
+-- helper function for comparison operators >, <, <=, >=
+compileComparisonOp :: String -> String -> String -> ((String, String) -> (String, String)) -> Expr -> Expr -> String -> Compiler [String]
+compileComparisonOp unsignedOp signedOp opName switchOps left right r = do
+    [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
+    op <- case (leftType, rightType) of
+        (TypeInt, TypeInt) -> return signedOp
+        (TypeUint, TypeUint) -> return unsignedOp
+        (TypeChar, TypeChar) -> return unsignedOp
+        _ -> typeError $ opName ++ " can only be used on matching integral or char types, not " ++ show leftType ++ " and " ++ show rightType
+    leftCode <- compileExpr left r
+    rr <- getReg
+    rightCode <- compileExpr right rr
+    freeReg rr
+    let (swapR, swapRR) = switchOps (r,rr)
+    return $ leftCode ++ rightCode ++
+            ["SET EX, 0",
+             op ++ " " ++ swapR ++ ", " ++ swapRR,
+             "SET EX, 1",
+             "SET " ++ r ++ ", EX"]
+
+swap :: (a, b) -> (b, a)
+swap (a,b) = (b,a)
 
 -- returns the registers to be saved before making a function call.
 -- saves A, B, and C, unless they are unused or the ultimate target for the return value.
