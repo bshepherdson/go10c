@@ -247,6 +247,7 @@ findLocals (_:rest) = findLocals rest
 
 -- finds variables and functions in a list of statements, intended for use on a whole file.
 findSymbols :: [Statement] -> [(QualIdent, Type)]
+findSymbols [] = []
 findSymbols (StmtVarDecl s t _ : rest) = (QualIdent Nothing s, t) : findSymbols rest
 findSymbols (StmtFunction name args ret _ : rest) = (QualIdent Nothing name, TypeFunction (map snd args) ret) : findSymbols rest
 findSymbols (_:rest) = findSymbols rest
@@ -619,12 +620,13 @@ compile (StmtIf initializer condition ifbody elsebody) = do
     -- at the end of the body a jump to the end is computed to skip over the else block.
     -- or is it easier to go in reverse?
 
-    ct <- typeCheck condition
-    when (ct /= TypeBool) $ typeError $ "Condition of an if statement must have type bool, found " ++ show ct
-
     -- push the new scope before compiling the initializer, since any variables it defines are scoped in the if.
     modify $ \s -> s { symbols = M.empty : symbols s }
     initCode <- concat <$> mapM compile initializer
+
+    ct <- typeCheck condition
+    when (ct /= TypeBool) $ typeError $ "Condition of an if statement must have type bool, found " ++ show ct
+
     r <- getReg
     condCode <- compileExpr condition r
 
@@ -651,16 +653,19 @@ compile (StmtIf initializer condition ifbody elsebody) = do
 
 
 compile (StmtFor initializer condition incrementer body) = do
-    ct <- typeCheck condition
-    when (ct /= TypeBool) $ typeError $ "Loop condition must have type bool, found " ++ show ct
-
     prefix <- uniqueLabel
 
     -- add the new scope before the initializer
     modify $ \s -> s { symbols = M.empty : symbols s }
 
     initCode <- concat <$> mapM compile initializer
+
     let topLabelCode = [LabelDef (prefix ++ "_top")]
+
+    -- have to typecheck after the initializer is compiled, or a condition that references a newly initialized variable will error.
+    ct <- typeCheck condition
+    when (ct /= TypeBool) $ typeError $ "Loop condition must have type bool, found " ++ show ct
+
 
     r <- getReg
     condCode <- compileExpr condition r
