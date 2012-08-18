@@ -71,7 +71,7 @@ runCompiler (Compiler a) s = runStateT a s
 doCompile :: SourceFile -> IO [String]
 doCompile (SourceFile thePackage imports statements) = do
     let allGlobals = findVariables statements
-        allTypes = M.fromList $ findTypes statements
+        allTypes = M.fromList $ findTypes statements ++ builtinTypes
         globalCode = flip concatMap allGlobals $ \(QualIdent _ g, t) -> [":" ++ mkLabel g] ++ replicate (typeSizeInternal allTypes t) "DAT 0" -- include the label and enough space for the global
         -- a function called main becomes the start point.
         -- if we have a main, compile a jump to it as the first bit of code.
@@ -97,6 +97,16 @@ doCompile (SourceFile thePackage imports statements) = do
     (compiledCode, finalState) <- runCompiler (concat <$> mapM compile statements) cs
     let stringsCode = concatMap (\(label, str) -> [":" ++ label, "DAT \"" ++ str ++ "\", 0"]) (strings finalState)
     return $ startCode ++ globalCode ++ stringsCode ++ compiledCode
+
+-- All built-in types: int, uint, char, string, bool.
+builtinTypes :: [(QualIdent, Type)]
+builtinTypes = [(QualIdent Nothing "string", TypeString)
+               ,(QualIdent Nothing "int", TypeInt)
+               ,(QualIdent Nothing "uint", TypeUint)
+               ,(QualIdent Nothing "char", TypeChar)
+               ,(QualIdent Nothing "bool", TypeBool)
+               ]
+
 
 -- returns the type of a symbol, dying with an error if it's not found.
 lookupSymbol :: QualIdent -> Compiler Type
@@ -279,8 +289,8 @@ typeCheck (UnOp (LOp op) x) = let
             "&" -> TypePointer <$> typeCheck x
 
 typeCheck (BinOp (LOp op) left right) = do
-    leftType <- typeCheck left
-    rightType <- typeCheck right
+    leftType <- underlyingType =<< typeCheck left
+    rightType <- underlyingType =<< typeCheck right
     case op of
         "+" -> do
             case (leftType, rightType) of
@@ -783,7 +793,7 @@ compileIntegralBinOp unsignedOp signedOp opName left right r = do
     rr <- getReg
     rightCode <- compileExpr right rr
     freeReg rr
-    return $ leftCode ++ rightCode ++ [op ++ " " ++ r ++ ", " ++ r]
+    return $ leftCode ++ rightCode ++ [op ++ " " ++ r ++ ", " ++ rr]
 
 
 compileEqBinOp :: String -> String -> Expr -> Expr -> String -> Compiler [String]
