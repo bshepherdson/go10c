@@ -1,4 +1,18 @@
-Things handled differently from standard Go:
+# go10c
+
+go10c is a compiler from a dialect of Google Go to DCPU-16 assembly. It is written in Haskell.
+
+## Details
+
+* The output is intended to be fed to [das](https://github.com/jonpovey/das), but most DCPU-16 version 1.7-compliant assemblers that use Notch's syntax (rather than gas syntax) will work.
+* Assembly quirks:
+    - Uses the `HCF` "halt and catch fire" instruction.
+    - Uses the `DAT` pseudoinstruction that compiles literal data into the binary, with values separated by commas and allowing string literals (`DAT "example", 0` inserts a C string literal, including the null terminator, one ASCII value per 16-bit word).
+    - Does **not** rely on das's complex constant expressions.
+
+## Differences from standard Go
+
+* No garbage collection. See below about `new` and `delete`.
 * The only types are:
     - `uint` (16-bit unsigned integer)
     - `int` (16-bit 2's complement signed integer)
@@ -19,19 +33,16 @@ Things handled differently from standard Go:
 * Methods, interfaces, closures, function pointers, slices, maps, and all concurrency constructs are left out for now. Possibly in a future version. I realize this is all the interesting bits, but so be it.
 * Newly allocated values, local and global values **are not** set to 0. Do not rely on them.
 * Global variables may not have initializers; they will be ignored.
-* Execution begins at _main_main.
-* The output is in the form of standard DCPU-16 assembly, with the syntax of nonstandard directives as used by [https://github.com/jonpovey/das](das). It uses:
-    - `:notch-style` labels
-    - `DAT` pseudoinstruction that compiles literal data into the binary, with values separated by commas and allowing string literals (`DAT "example", 0` inserts a C string literal, including the null terminator, one ASCII value per word).
+* Execution begins at `main()`. A file may be compiled that has no `main()`; in that case it is a library, and an attempt to execute the file will make the DCPU halt and catch fire.
 * Constants are unsupported for now.
 * Struct changes:
     - Tags are not supported.
     - Anonymous fields are not supported.
 * Variadic functions and the `...` syntax for them are not supported.
 * Types cannot be omitted in variable declarations, even when unambiguous default values are given.
-* Short variable declarations (with `:=`) are not supported because inferring of types from expressions is not supported. This is one of my highest priorities for v1.1.
 * Struct literals must have their keys provided. Array literals do not support indexes.
 * Taking the address of a literal, including a struct or array literal, is not supported.
-* Multi-value assignments are not supported.
-* For loop range clauses are not supported.
+* `range` clauses on for loops are not supported.
+
+Some of these restrictions may be lifted in future versions.
 
