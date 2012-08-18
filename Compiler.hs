@@ -602,6 +602,7 @@ compile (StmtAssignment Nothing lvalue rvalue) = do
     -- if we get down here, then this assignment is legal, so compile it.
     r <- getReg
     exprCode <- compileExpr rvalue r
+    freeReg r
     case lvalue of
         (Var i) -> do
             locCode <- lookupLocation i >>= compileLocation

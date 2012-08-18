@@ -13,4 +13,6 @@ This file lists optimizations I have observed that can be made in the generated 
     * To do this kind of optimization, things would be much simpler with an ADT for the assembly. I should do that transformation.
 * Assignments like `+=` and `-=` can be performed using `ADD` instead of computing and setting separately.
 * Comparison operators followed by `if` or `for` conditions can combine computing a boolean value and then checking it into a single branch instruction.
+* Multiple `SET PC, ...` lines in a row can be elided.
+* Negative integer literals could be compiled directly and/or optimized into one instruction instead of 3.
 
