@@ -53,9 +53,9 @@ data CompilerState = CS {
     ,unique :: Int -- an incrementing number to allow the construction of globally unique labels.
     }
 
-data Location = Reg String
-              | Stack Int -- places above the stack pointer
-              | Label String -- in the given label
+data Location = LocReg String
+              | LocStack Int -- places above the stack pointer
+              | LocLabel String -- in the given label
 
 
 newtype Compiler a = Compiler (StateT CompilerState IO a)
@@ -67,19 +67,112 @@ runCompiler :: Compiler a -> CompilerState -> IO (a, CompilerState)
 runCompiler (Compiler a) s = runStateT a s
 
 
+-- ADT for the output opcodes, to allow for pattern matched optimizations
+data Asm = SET Arg Arg
+         | ADD Arg Arg
+         | SUB Arg Arg
+         | MUL Arg Arg
+         | MLI Arg Arg
+         | DIV Arg Arg
+         | DVI Arg Arg
+         | MOD Arg Arg
+         | MDI Arg Arg
+         | AND Arg Arg
+         | BOR Arg Arg
+         | XOR Arg Arg
+         | SHR Arg Arg
+         | ASR Arg Arg
+         | SHL Arg Arg
+         | IFB Arg Arg
+         | IFC Arg Arg
+         | IFE Arg Arg
+         | IFN Arg Arg
+         | IFG Arg Arg
+         | IFA Arg Arg
+         | IFL Arg Arg
+         | IFU Arg Arg
+         -- ADX, SBX, STI and STD are not used.
+         | JSR Arg
+         -- INT, IAG, IAS, RFI, IAQ, HWN, HWQ and HWI are not used.
+         | HCF -- arg is unused, compiles a literal 0.
+         | LabelDef String
+         | DAT String -- DAT statement with the literal asm following
+
+data Arg = Reg String -- used only for main registers A-J
+         | PUSH
+         | POP
+         | PEEK
+         | SP
+         | PC
+         | EX
+         | Lit Int
+         | AddrLit Int
+         | AddrReg String -- main registers only!
+         | AddrRegLit String Int -- likewise
+         | AddrLabel String
+         | Label String
+    deriving (Eq)
+
+instance Show Asm where
+    show (JSR a) = "JSR " ++ show a
+    show HCF = "HCF 0"
+    show (LabelDef s) = ":" ++ s
+    show (DAT s) = "DAT " ++ s
+    show (SET b a) = "SET " ++ show b ++ ", " ++ show a
+    show (ADD b a) = "ADD " ++ show b ++ ", " ++ show a
+    show (SUB b a) = "SUB " ++ show b ++ ", " ++ show a
+    show (MUL b a) = "MUL " ++ show b ++ ", " ++ show a
+    show (MLI b a) = "MLI " ++ show b ++ ", " ++ show a
+    show (DIV b a) = "DIV " ++ show b ++ ", " ++ show a
+    show (DVI b a) = "DVI " ++ show b ++ ", " ++ show a
+    show (MOD b a) = "MOD " ++ show b ++ ", " ++ show a
+    show (MDI b a) = "MDI " ++ show b ++ ", " ++ show a
+    show (AND b a) = "AND " ++ show b ++ ", " ++ show a
+    show (BOR b a) = "BOR " ++ show b ++ ", " ++ show a
+    show (XOR b a) = "XOR " ++ show b ++ ", " ++ show a
+    show (SHR b a) = "SHR " ++ show b ++ ", " ++ show a
+    show (ASR b a) = "ASR " ++ show b ++ ", " ++ show a
+    show (SHL b a) = "SHL " ++ show b ++ ", " ++ show a
+    show (IFB b a) = "IFB " ++ show b ++ ", " ++ show a
+    show (IFC b a) = "IFC " ++ show b ++ ", " ++ show a
+    show (IFE b a) = "IFE " ++ show b ++ ", " ++ show a
+    show (IFN b a) = "IFN " ++ show b ++ ", " ++ show a
+    show (IFG b a) = "IFG " ++ show b ++ ", " ++ show a
+    show (IFA b a) = "IFA " ++ show b ++ ", " ++ show a
+    show (IFL b a) = "IFL " ++ show b ++ ", " ++ show a
+    show (IFU b a) = "IFU " ++ show b ++ ", " ++ show a
+
+instance Show Arg where
+    show (Reg s) = s
+    show PUSH = "PUSH"
+    show POP = "POP"
+    show PEEK = "PEEK"
+    show SP = "SP"
+    show PC = "PC"
+    show EX = "EX"
+    show (Lit n) = show n
+    show (AddrLit n) = "[" ++ show n ++ "]"
+    show (AddrReg r) = "[" ++ r ++ "]"
+    show (AddrRegLit r n) = "[" ++ r ++ "+" ++ show n ++ "]"
+    show (AddrLabel s) = "[" ++ s ++ "]"
+    show (Label s) = s
+
+-- shorthand for a binary "opcode" like IFG or ADD, used in expression helper functions.
+type Opcode = Arg -> Arg -> Asm
+
 -- TODO: Handle imports
-doCompile :: SourceFile -> IO [String]
+doCompile :: SourceFile -> IO [Asm]
 doCompile (SourceFile thePackage imports statements) = do
     let allGlobals = findVariables statements
         allTypes = M.fromList $ findTypes statements ++ builtinTypes
-        globalCode = flip concatMap allGlobals $ \(QualIdent _ g, t) -> [":" ++ mkLabel g] ++ replicate (typeSizeInternal allTypes t) "DAT 0" -- include the label and enough space for the global
+        globalCode = flip concatMap allGlobals $ \(QualIdent _ g, t) -> [LabelDef (mkLabel g)] ++ replicate (typeSizeInternal allTypes t) (DAT "0") -- include the label and enough space for the global
         -- a function called main becomes the start point.
         -- if we have a main, compile a jump to it as the first bit of code.
         -- if we don't, compile an HCF 0.
         allSymbols = findSymbols statements
         startCode = case lookup (QualIdent Nothing "main") allSymbols of
-            Nothing -> ["HCF 0"]
-            Just _  -> ["SET PC, " ++ mkLabel "main"]
+            Nothing -> [HCF]
+            Just _  -> [SET PC (Label (mkLabel "main"))]
 
         cs = CS {
             symbols = [ M.fromList allSymbols ],
@@ -89,13 +182,13 @@ doCompile (SourceFile thePackage imports statements) = do
             types = allTypes,
             args = [],
             locals = [],
-            globals = map (\(g@(QualIdent _ n), _) -> (g, Label (mkLabel n))) allGlobals,
+            globals = map (\(g@(QualIdent _ n), _) -> (g, LocLabel (mkLabel n))) allGlobals,
             this = "",
             unique = 1
         }
 
     (compiledCode, finalState) <- runCompiler (concat <$> mapM compile statements) cs
-    let stringsCode = concatMap (\(label, str) -> [":" ++ label, "DAT \"" ++ str ++ "\", 0"]) (strings finalState)
+    let stringsCode = concatMap (\(label, str) -> [LabelDef label, DAT $ "\"" ++ str ++ "\", 0"]) (strings finalState)
     return $ startCode ++ globalCode ++ stringsCode ++ compiledCode
 
 -- All built-in types: int, uint, char, string, bool.
@@ -426,7 +519,7 @@ lookupType i = do
 -- Compiles a Statement into a string of assembly code to perform it.
 -- Should not add symbols to the table on a TypeDecl or VarDecl. They should have been added by the scan performed when beginning a block/file.
 -- Initializers for variables should still be compiled in place (because they might depend on the values of other variables).
-compile :: Statement -> Compiler [String]
+compile :: Statement -> Compiler [Asm]
 compile (StmtTypeDecl name t) = error "TypeDecls are not to be compiled."
 
 -- note that this doesn't add the symbol, but rather expects it to already exist. this does compile initializers, though.
@@ -446,19 +539,19 @@ compile (StmtFunction name args ret (Just body)) = do
     s <- get
     let allLocals = findLocals body -- [(QualIdent, Type)]
         localCount = length allLocals
-        argLocations = [Reg "A", Reg "B", Reg "C"] ++ map Stack [localCount+2..] -- they're deeper than the locals, and the first three are in registers. +1 because the old PC return address is stored on top of them, and the base pointer is stored on top of that.
+        argLocations = [LocReg "A", LocReg "B", LocReg "C"] ++ map LocStack [localCount+2..] -- they're deeper than the locals, and the first three are in registers. +1 because the old PC return address is stored on top of them, and the base pointer is stored on top of that.
         myArgs = zip (map (QualIdent Nothing . fst) args) argLocations -- [(QualIdent, Location)], as necessary
-        myLocalLocations = zip allLocals $ map Stack [0..]
+        myLocalLocations = zip allLocals $ map LocStack [0..]
         mySymbols = M.fromList $ map (first (QualIdent Nothing)) args -- locals are not included in the symbol table, they'll be added as their definitions pass by.
+        prefix = mkLabel name
         s' = s {
             locals = myLocalLocations,
             args = myArgs,
             dirtyRegs = [],
             freeRegs = drop (min 3 (length args)) ["A", "B", "C", "X", "Y", "Z", "I"],
             symbols = mySymbols : symbols s,
-            this = name }
+            this = prefix }
 
-        prefix = mkLabel name
 
     put s'
 
@@ -467,22 +560,22 @@ compile (StmtFunction name args ret (Just body)) = do
     s'' <- get
 
     -- add preamble and postamble, saving and restoring the dirty registers and quitting.
-    let preambleCode  = [":" ++ prefix,
-                         "SET PUSH, J",                     -- store the old value of J, the base pointer.
-                         "SUB SP, " ++ show localCount,     -- make room for the locals
-                         "SET J, SP"] ++                    -- and set J to be the new base pointer, pointing at the first local.
-                        map ("SET PUSH, " ++) (dirtyRegs s'')
-        postambleCode = [":" ++ prefix ++ "_done"] ++
-                        map (\r -> "SET " ++ r ++ ", POP") (reverse (dirtyRegs s'')) ++
-                        ["ADD SP, " ++ show localCount,     -- remove the locals
-                         "SET J, POP",                      -- restore the old base pointer.
-                         "SET PC, POP"]                     -- and return
+    let preambleCode  = [LabelDef prefix,
+                         SET PUSH (Reg "J"),                -- store the old value of J, the base pointer.
+                         SUB SP (Lit localCount),           -- make room for the locals
+                         SET (Reg "J") SP] ++               -- and set J to be the new base pointer, pointing at the first local.
+                        map (SET PUSH . Reg) (dirtyRegs s'')
+        postambleCode = [LabelDef (prefix ++ "_done")] ++
+                        map (\r -> SET (Reg r) POP) (reverse (dirtyRegs s'')) ++
+                        [ADD SP (Lit localCount),           -- remove the locals
+                         SET (Reg "J") POP,                 -- restore the old base pointer.
+                         SET PC POP]                        -- and return
 
     put s -- restore the original state, removing my locals, args and symbols.
     return $ preambleCode ++ bodyCode ++ postambleCode
 
 
-compile (StmtLabel s) = return [":" ++ s] -- this isn't easy to do re: labeled jumps and breaks and crap. maybe make this a container instead of an ordinary statement.
+compile (StmtLabel s) = return [LabelDef s] -- this isn't easy to do re: labeled jumps and breaks and crap. maybe make this a container instead of an ordinary statement.
 
 compile (StmtExpr x@(Call _ _)) = do
     r <- getReg
@@ -496,8 +589,8 @@ compile (StmtExpr x@(BuiltinCall _ _ _)) = do
     return code
 compile (StmtExpr x) = error $ "Suspicious code. Expression " ++ show x ++ " has no side effects."
 
-compile (StmtInc x) = compileIncDec "ADD " x
-compile (StmtDec x) = compileIncDec "SUB " x
+compile (StmtInc x) = compileIncDec ADD x
+compile (StmtDec x) = compileIncDec SUB x 
 
 compile (StmtAssignment Nothing lvalue rvalue) = do
     when (not $ isLvalue lvalue) $ compileError $ "Attempt to assign to non-lvalue " ++ show lvalue
@@ -512,7 +605,7 @@ compile (StmtAssignment Nothing lvalue rvalue) = do
     case lvalue of
         (Var i) -> do
             locCode <- lookupLocation i >>= compileLocation
-            return $ exprCode ++ ["SET " ++ locCode ++ ", " ++ r]
+            return $ exprCode ++ [SET locCode (Reg r)]
         _ -> error "Not implemented: Assigning to lvalues other than straight variables." -- TODO implement
 
 -- TODO: Optimization: some ops, like += and -=, can be optimized by using ADD instead of computing and setting. Priority low, though, only a couple of instructions wasted.
@@ -536,23 +629,23 @@ compile (StmtIf initializer condition ifbody elsebody) = do
 
     -- get a label prefix for this if, set 'this' appropriately.
     prefix <- uniqueLabel
-    let jumpCode = ["IFE " ++ r ++ ", 0",
-                    "SET PC, " ++ if null elsebody then prefix ++ "_endif" else prefix ++ "_else"] -- jump if the condition is false, since we're jumping to the else block.
+    let jumpCode = [IFE (Reg r) (Lit 0),
+                    SET PC (Label $ if null elsebody then prefix ++ "_endif" else prefix ++ "_else")] -- jump if the condition is false, since we're jumping to the else block.
     freeReg r -- don't need this reserved anymore, because the jump is now compiled.
     ifCode <- concat <$> mapM compile ifbody
-    let ifJumpCode = if null elsebody then [] else ["SET PC, " ++ prefix ++ "_endif"] -- add a jump to the end of the if body if there's an else to jump over.
+    let ifJumpCode = if null elsebody then [] else [SET PC (Label (prefix ++ "_endif"))] -- add a jump to the end of the if body if there's an else to jump over.
 
     elseCode <- case elsebody of
         [] -> return []
         _  -> do
             elseCode <- concat <$> mapM compile elsebody
-            return $ [":" ++ prefix ++ "_else"] ++ elseCode
+            return $ [LabelDef (prefix ++ "_else")] ++ elseCode
 
     -- TODO I think variables declared in any part of the if are spreading to the rest of it. Mostly harmless.
     -- remove the scope
     modify $ \s -> s { symbols = tail (symbols s) }
 
-    return $ initCode ++ condCode ++ jumpCode ++ ifCode ++ ifJumpCode ++ elseCode ++ [":" ++ prefix ++ "_endif"]
+    return $ initCode ++ condCode ++ jumpCode ++ ifCode ++ ifJumpCode ++ elseCode ++ [LabelDef (prefix ++ "_endif")]
 
 
 
@@ -566,19 +659,19 @@ compile (StmtFor initializer condition incrementer body) = do
     modify $ \s -> s { symbols = M.empty : symbols s }
 
     initCode <- concat <$> mapM compile initializer
-    let topLabelCode = [":" ++ prefix ++ "_top"]
+    let topLabelCode = [LabelDef (prefix ++ "_top")]
 
     r <- getReg
     condCode <- compileExpr condition r
-    let condCheckCode = ["IFE " ++ r ++ ", 0", "SET PC, " ++ prefix ++ "_end"]
+    let condCheckCode = [IFE (Reg r) (Lit 0), SET PC (Label (prefix ++ "_end"))]
     freeReg r
 
     bodyCode <- concat <$> mapM compile body
     incCode <- concat <$> mapM compile incrementer
 
-    let topJumpCode = ["SET PC, " ++ prefix ++ "_top"]
+    let topJumpCode = [SET PC (Label (prefix ++ "_top"))]
 
-    let endLabelCode = [":" ++ prefix ++ "_end"]
+    let endLabelCode = [LabelDef (prefix ++ "_end")]
 
     modify $ \s -> s { symbols = tail (symbols s) } -- remove the new loop scope.
 
@@ -592,49 +685,49 @@ compile (StmtReturn mx) = do
             r <- getReg
             code <- compileExpr x r
             freeReg r
-            return $ code ++ ["SET A, " ++ r]
+            return $ code ++ [SET (Reg "A") (Reg r)]
     t <- gets this
-    return $ exprCode ++ ["SET PC, " ++ t ++ "_done"]
+    return $ exprCode ++ [SET PC (Label (t ++ "_done"))]
 
 
-compile (StmtGoto label) = return ["SET PC, " ++ label]
+compile (StmtGoto label) = return [SET PC (Label label)]
 
-compile _ = compileError "Not implemented"
+compile s = compileError $ "Not implemented: " ++ show s
 
 
-compileIncDec :: String -> Expr -> Compiler [String]
+compileIncDec :: (Arg -> Arg -> Asm) -> Expr -> Compiler [Asm]
 compileIncDec opcode (Var i) = do
     xt <- typeCheck (Var i)
     xut <- underlyingType xt
     case xut of
         TypeInt -> do
             locCode <- lookupLocation i >>= compileLocation
-            return [opcode ++ locCode ++ ", 1"]
+            return [opcode locCode (Lit 1)]
         _ -> typeError $ "Attempt to ++ or -- non-int type " ++ show xt
 
 
 -- turns a Location into the assembly string representing it
-compileLocation :: Location -> Compiler String
-compileLocation (Reg r) = return r
-compileLocation (Stack n) = return $ "PICK " ++ show n
-compileLocation (Label s) = return $ "[" ++ s ++ "]"
+compileLocation :: Location -> Compiler Arg
+compileLocation (LocReg r)   = return $ Reg r
+compileLocation (LocStack n) = return $ AddrRegLit "J" n -- can't use PICK or SP, unknown levels of saved values piled on top. Use J, the frame pointer.
+compileLocation (LocLabel s) = return $ AddrLabel s
 
 
 -- compiles an expression, storing the result in the given register.
-compileExpr :: Expr -> String -> Compiler [String]
-compileExpr (LitInt n) r = return ["SET " ++ r ++ ", " ++ show n]
-compileExpr (LitBool b) r = return ["SET " ++ r ++ ", " ++ (if b then "1" else "0")]
-compileExpr (LitChar c) r = return ["SET " ++ r ++ ", " ++ show (ord c)]
+compileExpr :: Expr -> String -> Compiler [Asm]
+compileExpr (LitInt n) r = return [SET (Reg r) (Lit n)]
+compileExpr (LitBool b) r = return [SET (Reg r) (Lit (if b then 1 else 0))]
+compileExpr (LitChar c) r = return [SET (Reg r) (Lit (ord c))]
 compileExpr (LitString s) r = do
     unique <- uniqueLabel
     modify $ \st -> st { strings = (unique, s) : strings st }
-    return ["SET " ++ r ++ ", " ++ unique]
+    return [SET (Reg r) (Label unique)]
 
 compileExpr (LitComposite _ _) _ = error "Composite literals not implemented"
 
 compileExpr (Var i) r = do
     loc <- lookupLocation i >>= compileLocation
-    return ["SET " ++ r ++ ", " ++ loc]
+    return [SET (Reg r) loc]
 
 compileExpr (Selector _ _) _ = error "Selectors not implemented"
 
@@ -646,16 +739,16 @@ compileExpr (Index arr ix) r = do
     ixCode <- compileExpr ix ixR
     freeReg ixR
     return $ arrCode ++ ixCode ++ 
-             (if size > 1 then ["MUL " ++ ixR ++ ", " ++ show size] else []) ++ -- if the size of the array elements is > 1, multiply from the index to the offset. TODO optimization trivial: shift for sizes that are powers of 2.
-             ["ADD " ++ r ++ ", " ++ ixR, "SET " ++ r ++ ", [" ++ r ++ "]"]
+             (if size > 1 then [MUL (Reg ixR) (Lit size)] else []) ++ -- if the size of the array elements is > 1, multiply from the index to the offset. TODO optimization trivial: shift for sizes that are powers of 2.
+             [ADD (Reg r) (Reg ixR), SET (Reg r) (AddrReg r)]
 
 compileExpr (Call (Var f) args) r = do
     when (length args >= 4) $ error "Functions with more than 3 arguments are not implemented."
     (saveCode, restoreCode) <- saveRegsForCall r
 
     argCode <- concat <$> sequence (zipWith compileExpr args ["A", "B", "C"])
-    let jsrCode = ["JSR " ++ mkLabel (name f)]
-        returnCode = ["SET " ++ r ++ ", A"]
+    let jsrCode = [JSR (Label (mkLabel (name f)))]
+        returnCode = [SET (Reg r) (Reg "A")]
 
     return $ saveCode ++ argCode ++ jsrCode ++ returnCode ++ restoreCode
 
@@ -667,19 +760,19 @@ compileExpr (BuiltinCall LNew (Just (TypeArray t)) (n:_)) r = do
     size <- typeSize t
     lengthCode <- compileExpr n r
     return $ saveCode ++ lengthCode ++
-             ["SET A, " ++ show size,
-              "MUL A, " ++ r,         -- size in words
-              "JSR heap.alloc"] ++    -- pointer is stored in A
-             (if r /= "A" then ["SET " ++ r ++ ", A"] else []) ++
+             [SET (Reg "A") (Lit size),
+              MUL (Reg "A") (Reg r),          -- size in words
+              JSR (Label "heap.alloc")] ++    -- pointer is stored in A
+             (if r /= "A" then [SET (Reg r) (Reg "A")] else []) ++
              restoreCode
 
 compileExpr (BuiltinCall LNew (Just t) _) r = do
     (saveCode, restoreCode) <- saveRegsForCall r
     size <- typeSize t
     return $ saveCode ++
-             ["SET A, " ++ show size,
-              "JSR heap.alloc"] ++ -- pointer is stored in A
-             (if r /= "A" then ["SET " ++ r ++ ", A"] else []) ++
+             [SET (Reg "A") (Lit size),
+              JSR (Label "heap.alloc")] ++ -- pointer is stored in A
+             (if r /= "A" then [SET (Reg r) (Reg "A")] else []) ++
              restoreCode
 
 compileExpr (BuiltinCall LNew _ _) _ = compileError "new() called with no type as an argument"
@@ -688,11 +781,11 @@ compileExpr (BuiltinCall LDelete Nothing [x]) _ = do
     (saveCode, restoreCode) <- saveRegsForCall "_" -- placeholder
     -- the type has already been checked, so just call it.
     expCode <- compileExpr x "A"
-    return $ saveCode ++ expCode ++ ["JSR heap.free"] ++ restoreCode
+    return $ saveCode ++ expCode ++ [JSR (Label "heap.free")] ++ restoreCode
 
 compileExpr (BuiltinCall LDelete _ _) _ = typeError "delete() must be called with exactly one pointer."
 
-compileExpr (BuiltinCall LPanic _ _) _ = return ["HCF 0"]
+compileExpr (BuiltinCall LPanic _ _) _ = return [HCF]
 
 
 compileExpr (Conversion t x) r = do
@@ -708,26 +801,26 @@ compileExpr (UnOp (LOp "-") x) r = do
     ut <- typeCheck x >>= underlyingType
     when (ut /= TypeInt && ut /= TypeUint) $ typeError $ "Cannot negate non-(u)int value of type " ++ show ut
     exprCode <- compileExpr x r
-    return $ exprCode ++ ["XOR " ++ r ++ ", 0xffff", "ADD " ++ r ++ ", 1"] -- 2s complement negation.
+    return $ exprCode ++ [XOR (Reg r) (Lit 0xffff), ADD (Reg r) (Lit 1)] -- 2s complement negation.
 
 compileExpr (UnOp (LOp "!") x) r = do
     ut <- typeCheck x >>= underlyingType
     when (ut /= TypeBool) $ typeError $ "Unary ! can only be applied to bool values."
     exprCode <- compileExpr x r
-    return $ exprCode ++ ["XOR " ++ r ++ ", 1"] -- MUST have booleans as 0 and 1, not 0 and nonzero or 0 and 0xffff
+    return $ exprCode ++ [XOR (Reg r) (Lit 1)] -- MUST have booleans as 0 and 1, not 0 and nonzero or 0 and 0xffff
 
 compileExpr (UnOp (LOp "^") x) r = do
     ut <- typeCheck x >>= underlyingType
     when (ut /= TypeInt && ut /= TypeUint) $ typeError $ "Unary ^ can only be applied to int and uint values."
     exprCode <- compileExpr x r
-    return $ exprCode ++ ["XOR " ++ r ++ ", 0xffff"]
+    return $ exprCode ++ [XOR (Reg r) (Lit 0xffff)]
 
 compileExpr (UnOp (LOp "*") x) r = do
     t <- typeCheck x
     ut <- underlyingType t
     when (not (isPointer ut)) $ typeError $ "Attempt to dereference non-pointer type " ++ show t
     exprCode <- compileExpr x r
-    return $ exprCode ++ ["SET " ++ r ++ ", [" ++ r ++ "]"]
+    return $ exprCode ++ [SET (Reg r) (AddrReg r)]
 
 compileExpr (UnOp (LOp "&") x) r = do
     when (not (isLvalue x)) $ typeError $ "Cannot take address of non-variable expression."
@@ -735,8 +828,8 @@ compileExpr (UnOp (LOp "&") x) r = do
         (Var i) -> do
             loc <- lookupLocation i
             case loc of
-                Reg _ -> typeError $ "Attempt to take address of value contained in a register " ++ show i
-                Stack n -> return ["SET " ++ r ++ ", J", "ADD " ++ r ++ ", " ++ show n]
+                LocReg _ -> typeError $ "Attempt to take address of value contained in a register " ++ show i
+                LocStack n -> return [SET (Reg r) (Reg "J"), ADD (Reg r) (Lit n)]
         (Index x i) -> do
             xt <- typeCheck x
             xut <- underlyingType xt
@@ -753,34 +846,34 @@ compileExpr (UnOp (LOp "&") x) r = do
             iCode <- compileExpr i ir
             freeReg ir
             return $ xCode ++ iCode ++
-                     (if size > 1 then ["MUL " ++ ir ++ ", " ++ show size] else []) ++
-                     ["ADD " ++ r ++ ", " ++ ir]
+                     (if size > 1 then [MUL (Reg ir) (Lit size)] else []) ++
+                     [ADD (Reg r) (Reg ir)]
         (Selector _ _) -> compileError $ "Struct selectors are not implemented."
         x -> typeError "Cannot take the address of this value."
 
 
-compileExpr (BinOp (LOp "+") left right) r = compileIntegralBinOp "ADD" "ADD" "+" left right r
-compileExpr (BinOp (LOp "-") left right) r = compileIntegralBinOp "SUB" "SUB" "-" left right r
-compileExpr (BinOp (LOp "*") left right) r = compileIntegralBinOp "MUL" "MLI" "*" left right r
-compileExpr (BinOp (LOp "/") left right) r = compileIntegralBinOp "DIV" "DVI" "/" left right r
-compileExpr (BinOp (LOp "%") left right) r = compileIntegralBinOp "MOD" "MDI" "%" left right r
-compileExpr (BinOp (LOp "|") left right) r = compileIntegralBinOp "BOR" "BOR" "|" left right r
-compileExpr (BinOp (LOp "^") left right) r = compileIntegralBinOp "XOR" "XOR" "^" left right r
-compileExpr (BinOp (LOp "&") left right) r = compileIntegralBinOp "AND" "AND" "&" left right r
-compileExpr (BinOp (LOp "<<") left right) r = compileIntegralBinOp "SHL" "SHL" "<<" left right r
-compileExpr (BinOp (LOp ">>") left right) r = compileIntegralBinOp "SHR" "ASR" ">>" left right r
+compileExpr (BinOp (LOp "+") left right) r = compileIntegralBinOp ADD ADD "+" left right r
+compileExpr (BinOp (LOp "-") left right) r = compileIntegralBinOp SUB SUB "-" left right r
+compileExpr (BinOp (LOp "*") left right) r = compileIntegralBinOp MUL MLI "*" left right r
+compileExpr (BinOp (LOp "/") left right) r = compileIntegralBinOp DIV DVI "/" left right r
+compileExpr (BinOp (LOp "%") left right) r = compileIntegralBinOp MOD MDI "%" left right r
+compileExpr (BinOp (LOp "|") left right) r = compileIntegralBinOp BOR BOR "|" left right r
+compileExpr (BinOp (LOp "^") left right) r = compileIntegralBinOp XOR XOR "^" left right r
+compileExpr (BinOp (LOp "&") left right) r = compileIntegralBinOp AND AND "&" left right r
+compileExpr (BinOp (LOp "<<") left right) r = compileIntegralBinOp SHL SHL "<<" left right r
+compileExpr (BinOp (LOp ">>") left right) r = compileIntegralBinOp SHR ASR ">>" left right r
 
-compileExpr (BinOp (LOp "==") left right) r = compileEqBinOp "IFE" "==" left right r
-compileExpr (BinOp (LOp "!=") left right) r = compileEqBinOp "IFN" "!=" left right r
+compileExpr (BinOp (LOp "==") left right) r = compileEqBinOp IFE "==" left right r
+compileExpr (BinOp (LOp "!=") left right) r = compileEqBinOp IFN "!=" left right r
 
-compileExpr (BinOp (LOp ">") left right) r = compileComparisonOp "IFG" "IFA" ">" id left right r
-compileExpr (BinOp (LOp "<") left right) r = compileComparisonOp "IFL" "IFU" "<" id left right r
-compileExpr (BinOp (LOp ">=") left right) r = compileComparisonOp "IFL" "IFU" ">=" swap left right r -- >= is < with the arguments swapped
-compileExpr (BinOp (LOp "<=") left right) r = compileComparisonOp "IFG" "IFA" "<=" swap left right r -- <= is > with the arguments swapped
+compileExpr (BinOp (LOp ">") left right) r = compileComparisonOp IFG IFA ">" id left right r
+compileExpr (BinOp (LOp "<") left right) r = compileComparisonOp IFL IFU "<" id left right r
+compileExpr (BinOp (LOp ">=") left right) r = compileComparisonOp IFL IFU ">=" swap left right r -- >= is < with the arguments swapped
+compileExpr (BinOp (LOp "<=") left right) r = compileComparisonOp IFG IFA "<=" swap left right r -- <= is > with the arguments swapped
 
 
 -- helper function for integral type binary operations like +, -, | and <<
-compileIntegralBinOp :: String -> String -> String -> Expr -> Expr -> String -> Compiler [String]
+compileIntegralBinOp :: Opcode -> Opcode -> String -> Expr -> Expr -> String -> Compiler [Asm]
 compileIntegralBinOp unsignedOp signedOp opName left right r = do
     [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
     op <- case (leftType, rightType) of
@@ -793,10 +886,10 @@ compileIntegralBinOp unsignedOp signedOp opName left right r = do
     rr <- getReg
     rightCode <- compileExpr right rr
     freeReg rr
-    return $ leftCode ++ rightCode ++ [op ++ " " ++ r ++ ", " ++ rr]
+    return $ leftCode ++ rightCode ++ [op (Reg r) (Reg rr)]
 
 
-compileEqBinOp :: String -> String -> Expr -> Expr -> String -> Compiler [String]
+compileEqBinOp :: Opcode -> String -> Expr -> Expr -> String -> Compiler [Asm]
 compileEqBinOp opCode opName left right r = do
     [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
     when (leftType /= rightType) $ typeError $ opName ++ " can only be used on matching integral or char types, not " ++ show leftType ++ " and " ++ show rightType
@@ -807,14 +900,14 @@ compileEqBinOp opCode opName left right r = do
     freeReg rr
 
     return $ leftCode ++ rightCode ++
-            ["SET EX, 0",
-             opCode ++ " " ++ r ++ ", " ++ rr,
-             "SET EX, 1",
-             "SET " ++ r ++ ", EX"]
+            [SET EX (Lit 0),
+             opCode (Reg r) (Reg rr),
+             SET EX (Lit 1),
+             SET (Reg r) EX]
 
 
 -- helper function for comparison operators >, <, <=, >=
-compileComparisonOp :: String -> String -> String -> ((String, String) -> (String, String)) -> Expr -> Expr -> String -> Compiler [String]
+compileComparisonOp :: Opcode -> Opcode -> String -> ((String, String) -> (String, String)) -> Expr -> Expr -> String -> Compiler [Asm]
 compileComparisonOp unsignedOp signedOp opName switchOps left right r = do
     [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
     op <- case (leftType, rightType) of
@@ -828,10 +921,10 @@ compileComparisonOp unsignedOp signedOp opName switchOps left right r = do
     freeReg rr
     let (swapR, swapRR) = switchOps (r,rr)
     return $ leftCode ++ rightCode ++
-            ["SET EX, 0",
-             op ++ " " ++ swapR ++ ", " ++ swapRR,
-             "SET EX, 1",
-             "SET " ++ r ++ ", EX"]
+            [SET EX (Lit 0),
+             op (Reg swapR) (Reg swapRR),
+             SET EX (Lit 1),
+             SET (Reg r) EX]
 
 swap :: (a, b) -> (b, a)
 swap (a,b) = (b,a)
@@ -845,12 +938,11 @@ regsToSave r = do
     return $ filter (not . (`elem` (r:free))) ["A", "B", "C"]
 
 -- given the register target for this expression, returns code to save the necessary subset of A, B and C before a call, and restore them afterward
-saveRegsForCall :: String -> Compiler ([String], [String])
+saveRegsForCall :: String -> Compiler ([Asm], [Asm])
 saveRegsForCall r = do
     rs <- regsToSave r
-    return (map ("SET PUSH, " ++) rs,
-            map (\r -> "SET " ++ r ++ ", POP") (reverse rs))
-
+    return (map (SET PUSH . Reg) rs,
+            map (\r -> SET (Reg r) POP) (reverse rs))
 
 
 isLvalue :: Expr -> Bool
@@ -861,7 +953,7 @@ isLvalue _ = False
 
 
 -- Sets the variable with the given name to the given expression, returns code to make it so (including computing the expression).
-setVar :: QualIdent -> Expr -> Compiler [String]
+setVar :: QualIdent -> Expr -> Compiler [Asm]
 setVar i x = do
     -- First look up the variable's type and check against the type of the expression.
     xt <- typeCheck x
@@ -875,18 +967,41 @@ setVar i x = do
     -- location of the variable
     loc <- lookupLocation i
     storeCode <- case loc of
-        Reg s -> return ["SET " ++ s ++ ", " ++ r]
-        Stack n -> return ["SET PICK " ++ show n ++ ", " ++ r]
-        Label l -> return ["SET [" ++ l ++ "], " ++ r]
+        LocReg s   -> return [SET (Reg s) (Reg r)]
+        LocStack n -> return [SET (AddrRegLit "J" n) (Reg r)]
+        LocLabel l -> return [SET (AddrLabel l) (Reg r)]
 
     freeReg r
     return $ exprCode ++ storeCode
+
+
+
+-- basic assembly optimizer
+-- current just removes known no-ops
+optimize :: [Asm] -> [Asm]
+optimize = filter (not.isNoop)
+
+-- checks whether a given instruction is a no-op
+isNoop :: Asm -> Bool
+isNoop (SET b a) | b == a    = True -- setting anything to itself is a no-op
+                 | otherwise = False
+isNoop (ADD _ (Lit 0)) = True
+isNoop (SUB _ (Lit 0)) = True
+isNoop (MUL _ (Lit 1)) = True
+isNoop (MLI _ (Lit 1)) = True
+isNoop (DIV _ (Lit 1)) = True
+isNoop (DVI _ (Lit 1)) = True
+isNoop _ = False
+
+
+
 
 
 main = do
     str <- getContents
     let parseTree = parseGo (alexScanTokens str)
     code <- doCompile parseTree
-    putStrLn $ unlines code
+    let code' = optimize code
+    putStrLn $ unlines $ map show code'
 
 

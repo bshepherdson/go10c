@@ -11,4 +11,6 @@ This file lists optimizations I have observed that can be made in the generated 
 * Plenty of `SET A, A`s are being generated.
 * Consider a last-minute pass over the assembly to remove known no-ops like `SET A, A` and `ADD/SUB A, 0` and others.
     * To do this kind of optimization, things would be much simpler with an ADT for the assembly. I should do that transformation.
+* Assignments like `+=` and `-=` can be performed using `ADD` instead of computing and setting separately.
+* Comparison operators followed by `if` or `for` conditions can combine computing a boolean value and then checking it into a single branch instruction.
 
