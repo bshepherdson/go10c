@@ -63,9 +63,40 @@ newtype Compiler a = Compiler (StateT CompilerState IO a)
 
 emptyCS = CS [] [] [] [] M.empty [] [] []
 
-runCompiler :: Compiler a -> CompilerState -> IO a
-runCompiler (Compiler a) s = fst <$> runStateT a s
+runCompiler :: Compiler a -> CompilerState -> IO (a, CompilerState)
+runCompiler (Compiler a) s = runStateT a s
 
+
+-- TODO: Handle imports
+doCompile :: SourceFile -> IO [String]
+doCompile (SourceFile thePackage imports statements) = do
+    let allGlobals = findVariables statements
+        allTypes = M.fromList $ findTypes statements
+        globalCode = flip concatMap allGlobals $ \(QualIdent _ g, t) -> [":" ++ mkLabel g] ++ replicate (typeSizeInternal allTypes t) "DAT 0" -- include the label and enough space for the global
+        -- a function called main becomes the start point.
+        -- if we have a main, compile a jump to it as the first bit of code.
+        -- if we don't, compile an HCF 0.
+        allSymbols = findSymbols statements
+        startCode = case lookup (QualIdent Nothing "main") allSymbols of
+            Nothing -> ["HCF 0"]
+            Just _  -> ["SET PC, " ++ mkLabel "main"]
+
+        cs = CS {
+            symbols = [ M.fromList allSymbols ],
+            dirtyRegs = [],
+            freeRegs = [],
+            strings = [],
+            types = allTypes,
+            args = [],
+            locals = [],
+            globals = map (\(g@(QualIdent _ n), _) -> (g, Label (mkLabel n))) allGlobals,
+            this = "",
+            unique = 1
+        }
+
+    (compiledCode, finalState) <- runCompiler (concat <$> mapM compile statements) cs
+    let stringsCode = concatMap (\(label, str) -> [":" ++ label, "DAT \"" ++ str ++ "\", 0"]) (strings finalState)
+    return $ startCode ++ globalCode ++ stringsCode ++ compiledCode
 
 -- returns the type of a symbol, dying with an error if it's not found.
 lookupSymbol :: QualIdent -> Compiler Type
@@ -105,7 +136,29 @@ findLocals :: [Statement] -> [QualIdent]
 findLocals [] = []
 findLocals (StmtVarDecl i _ _ : rest) = QualIdent Nothing i : findLocals rest
 findLocals (StmtShortVarDecl i _ : rest) = QualIdent Nothing i : findLocals rest
+findLocals (StmtIf initializer _ ifblock elseblock : rest) = findLocals initializer ++ findLocals ifblock ++ findLocals elseblock ++ findLocals rest
+findLocals (StmtFor initializer _ incrementer block : rest) = findLocals initializer ++ findLocals incrementer ++ findLocals block ++ findLocals rest
+findLocals (StmtSwitch initializer _ cases : rest) = findLocals initializer ++ concatMap (findLocals.snd) cases ++ findLocals rest
 findLocals (_:rest) = findLocals rest
+
+
+-- finds variables and functions in a list of statements, intended for use on a whole file.
+findSymbols :: [Statement] -> [(QualIdent, Type)]
+findSymbols (StmtVarDecl s t _ : rest) = (QualIdent Nothing s, t) : findSymbols rest
+findSymbols (StmtFunction name args ret _ : rest) = (QualIdent Nothing name, TypeFunction (map snd args) ret) : findSymbols rest
+findSymbols (_:rest) = findSymbols rest
+
+-- finds variables with a shallow search. intended to find globals in the whole file.
+findVariables :: [Statement] -> [(QualIdent, Type)]
+findVariables [] = []
+findVariables (StmtVarDecl i t _ : rest) = (QualIdent Nothing i, t) : findVariables rest
+findVariables (_:rest) = findVariables rest
+
+-- finds type declarations in a list of statements, intended for use on a whole file.
+findTypes :: [Statement] -> [(QualIdent, Type)]
+findTypes [] = []
+findTypes (StmtTypeDecl s t : rest) = (QualIdent Nothing s, t) : findTypes rest
+findTypes (_:rest) = findTypes rest
 
 
 -- returns a free register to be used in an expression.
@@ -277,16 +330,24 @@ typeCheckEqOp op left right = do
 -- returns the size in words of a given type.
 -- int, uint, bool and char are all 1 word. pointers, including strings and arrays, are also 1 word.
 -- structs are the sum of the sizes of their fields
+typeSizeInternal :: SymbolTable -> Type -> Int
+typeSizeInternal _ TypeBool = 1
+typeSizeInternal _ TypeInt  = 1
+typeSizeInternal _ TypeUint = 1
+typeSizeInternal _ TypeChar = 1
+typeSizeInternal _ TypeString = 1
+typeSizeInternal _ (TypePointer _) = 1
+typeSizeInternal _ (TypeArray _) = 1
+typeSizeInternal _ TypeVoid = error "Void type has no size."
+typeSizeInternal syms (TypeStruct fields) = sum $ map (typeSizeInternal syms . snd) fields
+typeSizeInternal syms (TypeName s) = case M.lookup s syms of
+                                        Just t  -> typeSizeInternal syms t
+                                        Nothing -> error $ "Cannot resolve type name " ++ show s
+
 typeSize :: Type -> Compiler Int
-typeSize TypeBool = return 1
-typeSize TypeInt  = return 1
-typeSize TypeUint = return 1
-typeSize TypeChar = return 1
-typeSize TypeString = return 1
-typeSize (TypePointer _) = return 1
-typeSize (TypeArray _) = return 1
-typeSize TypeVoid = error "Void type has no size."
-typeSize (TypeStruct fields) = sum <$> mapM (typeSize.snd) fields
+typeSize t = do
+    ts <- gets types
+    return $ typeSizeInternal ts t
 
 
 isPointer :: Type -> Bool
@@ -789,39 +850,6 @@ isLvalue (Index x _) = isLvalue x
 isLvalue _ = False
 
 
-{-
-data Type = TypeName QualIdent
-          | TypeBool
-          | TypeChar
-          | TypeInt
-          | TypeString
-          | TypeArray Type
-          | TypeStruct [(String, Type)] -- a struct with its parameters and their types.
-          | TypePointer Type
-          | TypeFunction [Type] Type -- a function giving its argument types and (singular, in my Go) return type.
-          | TypeVoid -- nonexistent type used for functions without return values
-  deriving (Eq, Show)
-
-data Expr = LitInt Int
-          | LitBool Bool
-          | LitChar Char
-          | LitString String
-          | LitComposite Type [(Key, Expr)]
-          | Var QualIdent
-          | Selector Expr String
-          | Index Expr Expr -- array expression and index expression
-          | Call Expr [Expr] -- function expression and argument expressions
-          | BuiltinCall Token (Maybe Type) [Expr] -- token of builtin, maybe a type as the first arg, and a list of parameter expressions
-          | Conversion Type Expr
-          | UnOp Token Expr -- unary operator and expression
-          | BinOp Token Expr Expr -- binary operator and operands
-  deriving (Show)
-
-data QualIdent = QualIdent { package :: Maybe String, name :: String }
-  deriving (Eq, Ord)
-
--}
-
 -- Sets the variable with the given name to the given expression, returns code to make it so (including computing the expression).
 setVar :: QualIdent -> Expr -> Compiler [String]
 setVar i x = do
@@ -847,6 +875,8 @@ setVar i x = do
 
 main = do
     str <- getContents
-    print $ parseGo (alexScanTokens str)
+    let parseTree = parseGo (alexScanTokens str)
+    code <- doCompile parseTree
+    putStrLn $ unlines code
 
 

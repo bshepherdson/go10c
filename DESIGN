@@ -18,6 +18,7 @@ Things handled differently from standard Go:
 * `panic()` calls the DCPU-16 `HCF` "halt and catch fire" instruction.
 * Methods, interfaces, closures, function pointers, slices, maps, and all concurrency constructs are left out for now. Possibly in a future version. I realize this is all the interesting bits, but so be it.
 * Newly allocated values, local and global values **are not** set to 0. Do not rely on them.
+* Global variables may not have initializers; they will be ignored.
 * Execution begins at _main_main.
 * The output is in the form of standard DCPU-16 assembly, with the syntax of nonstandard directives as used by [https://github.com/jonpovey/das](das). It uses:
     - `:notch-style` labels
