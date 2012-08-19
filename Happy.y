@@ -115,9 +115,15 @@ ImportSpecs : ImportSpecs eol ImportSpec    { $3 : $1 }
             | ImportSpec                    { [$1] }
 
 ImportSpec :: { Import }
+ImportSpec : stringlit                  { Import Nothing $1 }
+
+{-
+Full version. Not supported currently; causes functions to be compiled as a label "_go10c_ShortName__func" instead of "_go10c_RealPackageName__func".
+ImportSpec :: { Import }
 ImportSpec : dot stringlit                  { Import Nothing $2 }
            | ident stringlit                { Import (Just $1) $2 }
-           | stringlit                      { Import Nothing $1 }
+           | stringlit                      { Import (Just $1) $1 }
+-}
 
 
 eol :: { Token }
@@ -202,7 +208,7 @@ TypeSpecs : TypeSpecs eol TypeSpec  { $3 ++ $1 }
           | TypeSpec                { $1 }
           {- no empty -}
 TypeSpec :: { [Statement] }
-TypeSpec : ident Type               { [StmtTypeDecl $1 $2] }
+TypeSpec : ident Type               { [StmtTypeDecl (QualIdent Nothing $1) $2] }
 
 
 VarDecl :: { [Statement] }
@@ -214,19 +220,19 @@ VarSpecs : VarSpecs eol VarSpec     { $3 ++ $1 }
          | VarSpec                  { $1 }
          {- no empty -}
 VarSpec :: { [Statement] }
-VarSpec : IdentifierList Type '=' ExpressionList    { let xs = map Just $4 ++ repeat Nothing in zipWith (\i x -> StmtVarDecl i $2 x) $1 xs }
-        | IdentifierList Type                       { map (\i -> StmtVarDecl i $2 Nothing) $1 }
+VarSpec : IdentifierList Type '=' ExpressionList    { let xs = map Just $4 ++ repeat Nothing in zipWith (\i x -> StmtVarDecl (QualIdent Nothing i) $2 x) $1 xs }
+        | IdentifierList Type                       { map (\i -> StmtVarDecl (QualIdent Nothing i) $2 Nothing) $1 }
 
 
 ShortVarDecl :: { [Statement] }
-ShortVarDecl : IdentifierList ':=' ExpressionList   { reverse (zipWith StmtShortVarDecl $1 $3) }
+ShortVarDecl : IdentifierList ':=' ExpressionList   { reverse (zipWith StmtShortVarDecl (map (QualIdent Nothing) $1) $3) }
 
 
 FunctionDecl :: { [Statement] }
-FunctionDecl : func ident Parameters Type Block             { [StmtFunction $2 $3 $4 (Just $5)] }
-             | func ident Parameters Block                  { [StmtFunction $2 $3 TypeVoid (Just $4)] }
-             | func ident Parameters Type                   { [StmtFunction $2 $3 $4 Nothing] }
-             | func ident Parameters                        { [StmtFunction $2 $3 TypeVoid Nothing] }
+FunctionDecl : func ident Parameters Type Block             { [StmtFunction (QualIdent Nothing $2) $3 $4 (Just $5)] }
+             | func ident Parameters Block                  { [StmtFunction (QualIdent Nothing $2) $3 TypeVoid (Just $4)] }
+             | func ident Parameters Type                   { [StmtFunction (QualIdent Nothing $2) $3 $4 Nothing] }
+             | func ident Parameters                        { [StmtFunction (QualIdent Nothing $2) $3 TypeVoid Nothing] }
 
 Parameters :: { [(String, Type)] }
 Parameters : OP ParameterList CP                            { reverse $2 }
@@ -525,12 +531,37 @@ data Type = TypeName QualIdent
           | TypePointer Type
           | TypeFunction [Type] Type -- a function giving its argument types and (singular, in my Go) return type.
           | TypeVoid -- nonexistent type used for functions without return values
-  deriving (Eq, Show)
+  deriving (Show)
 
-data Statement = StmtTypeDecl String Type
-               | StmtVarDecl String Type (Maybe Expr)
-               | StmtShortVarDecl String Expr
-               | StmtFunction String [(String, Type)] Type (Maybe [Statement])
+instance Eq Type where
+    (TypeName (QualIdent Nothing "int")) == TypeInt = True
+    TypeInt == (TypeName (QualIdent Nothing "int")) = True
+    TypeUint == (TypeName (QualIdent Nothing "uint")) = True
+    (TypeName (QualIdent Nothing "uint")) == TypeUint = True
+    TypeBool == (TypeName (QualIdent Nothing "bool")) = True
+    (TypeName (QualIdent Nothing "bool")) == TypeBool = True
+    TypeChar == (TypeName (QualIdent Nothing "char")) = True
+    (TypeName (QualIdent Nothing "char")) == TypeChar = True
+    TypeString == (TypeName (QualIdent Nothing "string")) = True
+    (TypeName (QualIdent Nothing "string")) == TypeString = True
+    TypeInt == TypeInt = True
+    TypeUint == TypeUint = True
+    TypeChar == TypeChar = True
+    TypeBool == TypeBool = True
+    TypeString == TypeString = True
+    (TypeName a) == (TypeName b) = a == b
+    (TypeArray a) == (TypeArray b) = a == b
+    (TypePointer a) == (TypePointer b) = a == b
+    TypeVoid == TypeVoid = True
+    (TypeStruct fs) == (TypeStruct gs) = and $ zipWith (==) (map snd fs) (map snd gs)
+    (TypeFunction as r) == (TypeFunction bs s) = r == s && and (zipWith (==) as bs)
+    _ == _ = False
+
+
+data Statement = StmtTypeDecl QualIdent Type
+               | StmtVarDecl QualIdent Type (Maybe Expr)
+               | StmtShortVarDecl QualIdent Expr
+               | StmtFunction QualIdent [(String, Type)] Type (Maybe [Statement])
                | StmtLabel String
                | StmtExpr Expr
                | StmtInc Expr

@@ -12,8 +12,16 @@ import Control.Applicative
 import Control.Arrow (first)
 
 import qualified Data.Map as M
-import Data.Maybe (isJust, isNothing)
-import Data.Char (ord)
+import Data.Maybe (isJust, isNothing, fromMaybe)
+import Data.Char (ord, isUpper)
+import Data.List
+import Data.Either (rights)
+
+import Control.Exception
+import System.Environment (getArgs)
+import System.Console.GetOpt
+import System.IO
+import System.Exit
 
 -- alright, thoughts:
 -- * need a symbol table to hold things we know about.
@@ -51,11 +59,12 @@ data CompilerState = CS {
     ,globals :: [(QualIdent, Location)] -- a list of global variables and their locations.
     ,this :: String -- the name of the function currently being compiled, used for labels.
     ,unique :: Int -- an incrementing number to allow the construction of globally unique labels.
-    }
+    } deriving (Show)
 
 data Location = LocReg String
               | LocStack Int -- places above the stack pointer
               | LocLabel String -- in the given label
+    deriving (Show)
 
 
 newtype Compiler a = Compiler (StateT CompilerState IO a)
@@ -160,19 +169,21 @@ instance Show Arg where
 -- shorthand for a binary "opcode" like IFG or ADD, used in expression helper functions.
 type Opcode = Arg -> Arg -> Asm
 
--- TODO: Handle imports
-doCompile :: SourceFile -> IO [Asm]
-doCompile (SourceFile thePackage imports statements) = do
+doCompile :: SourceFile -> [String] -> IO [Asm]
+doCompile (SourceFile thePackage imports statements_) libdirs = do
+    -- handle the imports
+    allImports <- evalStateT (importsClosure imports (if null libdirs then ["."] else libdirs)) []
+    let statements = allImports ++ statements_
     let allGlobals = findVariables statements
         allTypes = M.fromList $ findTypes statements ++ builtinTypes
-        globalCode = flip concatMap allGlobals $ \(QualIdent _ g, t) -> [LabelDef (mkLabel g)] ++ replicate (typeSizeInternal allTypes t) (DAT "0") -- include the label and enough space for the global
+        globalCode = flip concatMap allGlobals $ \(g, t) -> [LabelDef (mkLabel g)] ++ replicate (typeSizeInternal allTypes t) (DAT "0") -- include the label and enough space for the global
         -- a function called main becomes the start point.
         -- if we have a main, compile a jump to it as the first bit of code.
         -- if we don't, compile an HCF 0.
         allSymbols = findSymbols statements
         startCode = case lookup (QualIdent Nothing "main") allSymbols of
             Nothing -> [HCF]
-            Just _  -> [SET PC (Label (mkLabel "main"))]
+            Just _  -> [SET PC (Label (mkLabel (QualIdent Nothing "main")))]
 
         cs = CS {
             symbols = [ M.fromList allSymbols ],
@@ -182,7 +193,7 @@ doCompile (SourceFile thePackage imports statements) = do
             types = allTypes,
             args = [],
             locals = [],
-            globals = map (\(g@(QualIdent _ n), _) -> (g, LocLabel (mkLabel n))) allGlobals,
+            globals = map (\(g, _) -> (g, LocLabel (mkLabel g))) allGlobals,
             this = "",
             unique = 1
         }
@@ -190,6 +201,48 @@ doCompile (SourceFile thePackage imports statements) = do
     (compiledCode, finalState) <- runCompiler (concat <$> mapM compile statements) cs
     let stringsCode = concatMap (\(label, str) -> [LabelDef label, DAT $ "\"" ++ str ++ "\", 0"]) (strings finalState)
     return $ startCode ++ globalCode ++ stringsCode ++ compiledCode
+
+
+type ImportMonad a = StateT [String] IO a
+
+-- maintains a list of imports already imported as the state, returns all the top-level declarations from all the imports, in dependency order.
+importsClosure :: [Import] -> [String] -> ImportMonad [Statement]
+importsClosure [] _ = return []
+importsClosure (Import malias file : rest) libdirs = do
+    seen <- seenImport file
+    exports <- case seen of
+        True  -> return []
+        False -> do
+            fileAttempts <- liftIO $ mapM (\d -> loadFile (d ++ "/" ++ file ++ ".go")) libdirs -- try to look up the file in each directory in libdirs
+            SourceFile package innerImports statements <- case rights fileAttempts of
+                [] -> error $ "Could not find import named '" ++ file ++ "'. Search paths: " ++ unwords libdirs
+                (s:_) -> return s
+            modify (file:)
+            recursiveExports <- importsClosure innerImports libdirs
+            let exports = exportedStatements package statements
+            return $ recursiveExports ++ exports
+    laterExports <- importsClosure rest libdirs
+    return $ exports ++ laterExports
+
+--start here
+seenImport :: String -> ImportMonad Bool
+seenImport i = do
+    seen <- get
+    case filter (==i) seen of
+        (_:_) -> return True
+        []    -> return False
+
+
+-- returns the subset of statements from a list of statements which are exportable
+-- note that only functions and globals (and constants) with uppercase first letters are exported.
+exportedStatements :: String -> [Statement] -> [Statement]
+exportedStatements _ [] = []
+exportedStatements pkg (StmtTypeDecl (QualIdent Nothing i) t : rest) | isUpper (head i) = StmtTypeDecl (QualIdent (Just pkg) i) t : exportedStatements pkg rest
+exportedStatements pkg (StmtVarDecl (QualIdent Nothing i)  t x : rest) | isUpper (head i) = StmtVarDecl  (QualIdent (Just pkg) i) t x : exportedStatements pkg rest
+exportedStatements pkg (StmtShortVarDecl (QualIdent Nothing i) x : rest) | isUpper (head i) = StmtShortVarDecl (QualIdent (Just pkg) i) x : exportedStatements pkg rest
+exportedStatements pkg (StmtFunction (QualIdent Nothing i) args ret _ : rest) | isUpper (head i) = StmtFunction (QualIdent (Just pkg) i) args ret Nothing : exportedStatements pkg rest
+exportedStatements pkg (_:rest) = exportedStatements pkg rest
+
 
 -- All built-in types: int, uint, char, string, bool.
 builtinTypes :: [(QualIdent, Type)]
@@ -237,8 +290,8 @@ addSymbol i t = modify $ \s -> s { symbols = (M.insert i t (head (symbols s))) :
 -- Does a deep search to find all the local variables in a list of statements.
 findLocals :: [Statement] -> [QualIdent]
 findLocals [] = []
-findLocals (StmtVarDecl i _ _ : rest) = QualIdent Nothing i : findLocals rest
-findLocals (StmtShortVarDecl i _ : rest) = QualIdent Nothing i : findLocals rest
+findLocals (StmtVarDecl i _ _ : rest) = i : findLocals rest
+findLocals (StmtShortVarDecl i _ : rest) = i : findLocals rest
 findLocals (StmtIf initializer _ ifblock elseblock : rest) = findLocals initializer ++ findLocals ifblock ++ findLocals elseblock ++ findLocals rest
 findLocals (StmtFor initializer _ incrementer block : rest) = findLocals initializer ++ findLocals incrementer ++ findLocals block ++ findLocals rest
 findLocals (StmtSwitch initializer _ cases : rest) = findLocals initializer ++ concatMap (findLocals.snd) cases ++ findLocals rest
@@ -248,20 +301,20 @@ findLocals (_:rest) = findLocals rest
 -- finds variables and functions in a list of statements, intended for use on a whole file.
 findSymbols :: [Statement] -> [(QualIdent, Type)]
 findSymbols [] = []
-findSymbols (StmtVarDecl s t _ : rest) = (QualIdent Nothing s, t) : findSymbols rest
-findSymbols (StmtFunction name args ret _ : rest) = (QualIdent Nothing name, TypeFunction (map snd args) ret) : findSymbols rest
+findSymbols (StmtVarDecl s t _ : rest) = (s, t) : findSymbols rest
+findSymbols (StmtFunction name args ret _ : rest) = (name, TypeFunction (map snd args) ret) : findSymbols rest
 findSymbols (_:rest) = findSymbols rest
 
 -- finds variables with a shallow search. intended to find globals in the whole file.
 findVariables :: [Statement] -> [(QualIdent, Type)]
 findVariables [] = []
-findVariables (StmtVarDecl i t _ : rest) = (QualIdent Nothing i, t) : findVariables rest
+findVariables (StmtVarDecl i t _ : rest) = (i, t) : findVariables rest
 findVariables (_:rest) = findVariables rest
 
 -- finds type declarations in a list of statements, intended for use on a whole file.
 findTypes :: [Statement] -> [(QualIdent, Type)]
 findTypes [] = []
-findTypes (StmtTypeDecl s t : rest) = (QualIdent Nothing s, t) : findTypes rest
+findTypes (StmtTypeDecl s t : rest) = (s, t) : findTypes rest
 findTypes (_:rest) = findTypes rest
 
 
@@ -284,8 +337,9 @@ freeReg r = modify $ \s -> s { freeRegs = r : freeRegs s }
 
 
 -- turns a function name into a compiler label
-mkLabel :: String -> String
-mkLabel s = "_go10c_" ++ s
+mkLabel :: QualIdent -> String
+mkLabel (QualIdent (Just p) s) = mkLabel $ QualIdent Nothing $ p ++ "__" ++ s
+mkLabel (QualIdent Nothing  s) = "_go10c_" ++ s
 
 
 uniqueLabel :: Compiler String
@@ -524,19 +578,19 @@ compile :: Statement -> Compiler [Asm]
 compile (StmtTypeDecl name t) = error "TypeDecls are not to be compiled."
 
 -- note that this doesn't add the symbol, but rather expects it to already exist. this does compile initializers, though.
-compile (StmtVarDecl name t Nothing) = addSymbol (QualIdent Nothing name) t >> return [] -- nothing to do for a plain declaration
-compile (StmtVarDecl name t (Just x)) = addSymbol (QualIdent Nothing name) t >> setVar (QualIdent Nothing name) x
+compile (StmtVarDecl name t Nothing) = addSymbol name t >> return [] -- nothing to do for a plain declaration
+compile (StmtVarDecl name t (Just x)) = addSymbol name t >> setVar name x
 compile (StmtShortVarDecl name x) = do
     t <- typeCheck x
-    addSymbol (QualIdent Nothing name) t
-    setVar (QualIdent Nothing name) x
+    addSymbol name t
+    setVar name x
 compile (StmtFunction _ _ _ Nothing) = return []
 compile (StmtFunction name args ret (Just body)) = do
     -- so a function. we need a new scope pushed, as well as a new set of locations for local variables and arguments.
     -- here's how the base pointer is handled. we use J as a base pointer. it points at the first local.
     -- the locals are at J+0, J+1, J+2, etc. the old value of J is stored at J+n, and any stack-passed args are in J+n+1, J+n+2, ...
     -- first, harvest the locals from the function body.
-    addSymbol (QualIdent Nothing name) (TypeFunction (map snd args) ret) -- add the function to the symbol table before we grab the state, to allow recursion.
+    addSymbol name (TypeFunction (map snd args) ret) -- add the function to the symbol table before we grab the state, to allow recursion.
     s <- get
     let allLocals = findLocals body -- [(QualIdent, Type)]
         localCount = length allLocals
@@ -750,10 +804,13 @@ compileExpr (Index arr ix) r = do
 
 compileExpr (Call (Var f) args) r = do
     when (length args >= 4) $ error "Functions with more than 3 arguments are not implemented."
-    (saveCode, restoreCode) <- saveRegsForCall r
 
+    -- I don't need the type, but I do need to typecheck.
+    t <- typeCheck (Call (Var f) args)
+
+    (saveCode, restoreCode) <- saveRegsForCall r
     argCode <- concat <$> sequence (zipWith compileExpr args ["A", "B", "C"])
-    let jsrCode = [JSR (Label (mkLabel (name f)))]
+    let jsrCode = [JSR (Label (mkLabel f))]
         returnCode = [SET (Reg r) (Reg "A")]
 
     return $ saveCode ++ argCode ++ jsrCode ++ returnCode ++ restoreCode
@@ -1001,13 +1058,79 @@ isNoop _ = False
 
 
 
+data Options = Options {
+         optOutput :: String
+        ,optShowVersion :: Bool
+        ,optShowHelp :: Bool
+        ,optLibDirs :: [String]
+    } deriving (Show)
 
+defaultOptions = Options "" False False []
+
+
+options :: [OptDescr (Options -> Options)]
+options =
+    [ Option ['h'] ["help"]
+        (NoArg (\opts -> opts { optShowHelp = True }))
+        "Display this help message."
+    , Option [] ["version"]
+        (NoArg (\opts -> opts { optShowVersion = True }))
+        "Display version information."
+    , Option ['o'] ["output"]
+        (ReqArg ((\f opts -> opts { optOutput = f })) "FILE")
+        "Set the output file."
+    , Option ['L'] ["libdir"]
+        (ReqArg ((\d opts -> opts { optLibDirs = optLibDirs opts ++ [d] })) "DIR")
+        "Add a directory to the library search path."
+    ]
+
+compilerOpts :: [String] -> IO (Options, [String])
+compilerOpts argv = 
+    case getOpt Permute options argv of
+        (o,n,[])   -> return (foldl' (flip id) defaultOptions o, n)
+        (_,_,errs) -> ioError (userError (concat errs ++ usageInfo usageHeader options))
+
+usageHeader = "Usage: go10cc [OPTION...] inputfile"
+versionInfo = "go10cc v0.1  Copyright (C) 2012 Braden Shepherdson"
 
 main = do
-    str <- getContents
-    let parseTree = parseGo (alexScanTokens str)
-    code <- doCompile parseTree
-    let code' = optimize code
-    putStrLn $ unlines $ map show code'
+    argv <- getArgs
+    (opts, remaining) <- compilerOpts argv
+    inputFile <- case remaining of
+        [r] -> return r
+        []  -> error "No input file supplied."
+        _   -> error "Multiple input files are not supported. import your libraries and provide a single file on the command line."
 
+    quit <- case (optShowVersion opts, optShowHelp opts) of
+        (_, True) -> do
+            putStrLn $ usageInfo usageHeader options
+            return True
+        (True, False) -> do
+            putStrLn versionInfo
+            return True
+        _         -> return False
+
+    when quit $ exitWith ExitSuccess
+    
+    -- compile the main input file
+    eParseTree <- loadFile inputFile
+    parseTree <- case eParseTree of
+        Left e  -> error $ "Could not load input file: " ++ inputFile
+        Right p -> return p
+
+    code <- doCompile parseTree (optLibDirs opts)
+    let code' = optimize code
+    outputHandle <- openFile (optOutput opts) WriteMode
+    hPutStrLn outputHandle $ unlines $ map show code'
+    hClose outputHandle
+
+
+loadFile :: String -> IO (Either IOException SourceFile)
+loadFile name = do
+    hE <- try $ openFile name ReadMode
+    case hE of
+        Left e  -> return $ Left e
+        Right h -> do
+            str <- hGetContents h
+            return . Right $ parseGo (alexScanTokens str)
 
