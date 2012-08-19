@@ -59,6 +59,7 @@ data CompilerState = CS {
     ,globals :: [(QualIdent, Location)] -- a list of global variables and their locations.
     ,this :: String -- the name of the function currently being compiled, used for labels.
     ,unique :: Int -- an incrementing number to allow the construction of globally unique labels.
+    ,packageName :: String -- the package name for the file being compiled
     } deriving (Show)
 
 data Location = LocReg String
@@ -70,7 +71,6 @@ data Location = LocReg String
 newtype Compiler a = Compiler (StateT CompilerState IO a)
     deriving (Functor, Applicative, Monad, MonadState CompilerState, MonadIO)
 
-emptyCS = CS [] [] [] [] M.empty [] [] []
 
 runCompiler :: Compiler a -> CompilerState -> IO (a, CompilerState)
 runCompiler (Compiler a) s = runStateT a s
@@ -176,14 +176,14 @@ doCompile (SourceFile thePackage imports statements_) libdirs = do
     let statements = allImports ++ statements_
     let allGlobals = findVariables statements
         allTypes = M.fromList $ findTypes statements ++ builtinTypes
-        globalCode = flip concatMap allGlobals $ \(g, t) -> [LabelDef (mkLabel g)] ++ replicate (typeSizeInternal allTypes t) (DAT "0") -- include the label and enough space for the global
+        globalCode = flip concatMap allGlobals $ \(QualIdent mp i, t) -> [LabelDef (mkLabelInternal (fromMaybe thePackage mp) i)] ++ replicate (typeSizeInternal allTypes t) (DAT "0") -- include the label and enough space for the global
         -- a function called main becomes the start point.
         -- if we have a main, compile a jump to it as the first bit of code.
         -- if we don't, compile an HCF 0.
         allSymbols = findSymbols statements
         startCode = case lookup (QualIdent Nothing "main") allSymbols of
             Nothing -> [HCF]
-            Just _  -> [SET PC (Label (mkLabel (QualIdent Nothing "main")))]
+            Just _  -> [SET PC (Label (mkLabelInternal thePackage "main"))]
 
         cs = CS {
             symbols = [ M.fromList allSymbols ],
@@ -193,9 +193,10 @@ doCompile (SourceFile thePackage imports statements_) libdirs = do
             types = allTypes,
             args = [],
             locals = [],
-            globals = map (\(g, _) -> (g, LocLabel (mkLabel g))) allGlobals,
+            globals = map (\(g@(QualIdent mp i), _) -> (g, LocLabel (mkLabelInternal (fromMaybe thePackage mp) i))) allGlobals,
             this = "",
-            unique = 1
+            unique = 1,
+            packageName = thePackage
         }
 
     (compiledCode, finalState) <- runCompiler (concat <$> mapM compile statements) cs
@@ -308,7 +309,7 @@ findSymbols (_:rest) = findSymbols rest
 -- finds variables with a shallow search. intended to find globals in the whole file.
 findVariables :: [Statement] -> [(QualIdent, Type)]
 findVariables [] = []
-findVariables (StmtVarDecl i t _ : rest) = (i, t) : findVariables rest
+findVariables (StmtVarDecl i@(QualIdent Nothing _) t _ : rest) = (i, t) : findVariables rest
 findVariables (_:rest) = findVariables rest
 
 -- finds type declarations in a list of statements, intended for use on a whole file.
@@ -337,9 +338,15 @@ freeReg r = modify $ \s -> s { freeRegs = r : freeRegs s }
 
 
 -- turns a function name into a compiler label
-mkLabel :: QualIdent -> String
-mkLabel (QualIdent (Just p) s) = mkLabel $ QualIdent Nothing $ p ++ "__" ++ s
-mkLabel (QualIdent Nothing  s) = "_go10c_" ++ s
+mkLabel :: QualIdent -> Compiler String
+mkLabel (QualIdent (Just p) s) = return $ mkLabelInternal p s
+mkLabel (QualIdent Nothing  s) = do
+    pkg <- gets packageName
+    return $ mkLabelInternal pkg s
+
+
+mkLabelInternal :: String -> String -> String
+mkLabelInternal p s = "_go10c__" ++ p ++ "_" ++ s
 
 
 uniqueLabel :: Compiler String
@@ -598,8 +605,10 @@ compile (StmtFunction name args ret (Just body)) = do
         myArgs = zip (map (QualIdent Nothing . fst) args) argLocations -- [(QualIdent, Location)], as necessary
         myLocalLocations = zip allLocals $ map LocStack [0..]
         mySymbols = M.fromList $ map (first (QualIdent Nothing)) args -- locals are not included in the symbol table, they'll be added as their definitions pass by.
-        prefix = mkLabel name
-        s' = s {
+
+    prefix <- mkLabel name
+
+    let s' = s {
             locals = myLocalLocations,
             args = myArgs,
             dirtyRegs = [],
@@ -810,7 +819,8 @@ compileExpr (Call (Var f) args) r = do
 
     (saveCode, restoreCode) <- saveRegsForCall r
     argCode <- concat <$> sequence (zipWith compileExpr args ["A", "B", "C"])
-    let jsrCode = [JSR (Label (mkLabel f))]
+    label <- mkLabel f
+    let jsrCode = [JSR (Label label)]
         returnCode = [SET (Reg r) (Reg "A")]
 
     return $ saveCode ++ argCode ++ jsrCode ++ returnCode ++ restoreCode

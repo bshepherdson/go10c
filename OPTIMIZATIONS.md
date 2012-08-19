@@ -15,4 +15,5 @@ This file lists optimizations I have observed that can be made in the generated 
 * Comparison operators followed by `if` or `for` conditions can combine computing a boolean value and then checking it into a single branch instruction.
 * Multiple `SET PC, ...` lines in a row can be elided.
 * Negative integer literals could be compiled directly and/or optimized into one instruction instead of 3.
+* Empty functions can be optimized into a single `SET PC, POP`
 
