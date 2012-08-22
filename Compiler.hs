@@ -388,14 +388,17 @@ typeCheck (Index x i) = do
 typeCheck (Call f args) = do
     ft <- typeCheck f
     case ft of
-        (TypeFunction argTypes returnType) -> do
+        (TypeFunction argTypes returnType) -> check argTypes returnType
+        (TypePointer (TypeFunction argTypes returnType)) -> check argTypes returnType
+        _ -> typeError $ "Attempt to call a non-function value " ++ show f ++ " of type " ++ show ft
+  where check argTypes returnType = do
             providedArgTypes <- mapM typeCheck args
             let zipped = zip argTypes providedArgTypes
                 mismatched = dropWhile (uncurry (==)) zipped
             case mismatched of
                 [] -> return returnType -- function call is legal
                 ((expected, actual):_) -> typeError $ "Function call expected an argument of type " ++ show expected ++ " but got " ++ show actual ++ "."
-        _ -> typeError $ "Attempt to call a non-function value " ++ show f ++ " of type " ++ show ft
+
 
 typeCheck (BuiltinCall LNew (Just (TypeArray t)) [n]) = do
     nt <- typeCheck n
@@ -530,6 +533,9 @@ isArray _ = False
 -- * V and T are (unnamed) pointer types, and their pointer base types are convertible
 -- * V is []char and T is string
 -- * V is string and T is []char
+--
+-- But we need to be more flexible here than in the original spec, to allow better assembly integration. So we allow:
+-- * V is integral and T is any pointer or array type
 convertible :: Type -> Type -> Compiler Bool
 convertible l r = do
     assign <- assignable l r
@@ -544,6 +550,15 @@ convertible l r = do
         (_, _, TypePointer TypeChar, TypeString) -> return True
         (_, _, TypeString, TypeArray TypeChar) -> return True
         (_, _, TypeString, TypePointer TypeChar) -> return True
+        -- off-spec flexible integral->pointer/array casting.
+        (_, _, TypeUint, TypePointer _) -> return True
+        (_, _, TypeName (QualIdent Nothing "uint"), TypePointer _) -> return True
+        (_, _, TypeUint, TypeArray _) -> return True
+        (_, _, TypeName (QualIdent Nothing "uint"), TypeArray _) -> return True
+        (_, _, TypeInt, TypePointer _) -> return True
+        (_, _, TypeName (QualIdent Nothing "int"), TypePointer _) -> return True
+        (_, _, TypeInt, TypeArray _) -> return True
+        (_, _, TypeName (QualIdent Nothing "int"), TypeArray _) -> return True
         _ -> return False
 
 -- returns True if a value of the first type can be assigned to a variable of the second type
@@ -807,25 +822,33 @@ compileExpr (Index arr ix) r = do
     ixR <- getReg
     ixCode <- compileExpr ix ixR
     freeReg ixR
-    return $ arrCode ++ ixCode ++ 
+    return $ arrCode ++ ixCode ++
              (if size > 1 then [MUL (Reg ixR) (Lit size)] else []) ++ -- if the size of the array elements is > 1, multiply from the index to the offset. TODO optimization trivial: shift for sizes that are powers of 2.
              [ADD (Reg r) (Reg ixR), SET (Reg r) (AddrReg r)]
 
-compileExpr (Call (Var f) args) r = do
+compileExpr (Call f args) r = do
     when (length args >= 4) $ error "Functions with more than 3 arguments are not implemented."
 
     -- I don't need the type, but I do need to typecheck.
-    t <- typeCheck (Call (Var f) args)
+    t <- typeCheck (Call f args)
+    tf <- typeCheck f
 
     (saveCode, restoreCode) <- saveRegsForCall r
     argCode <- concat <$> sequence (zipWith compileExpr args ["A", "B", "C"])
-    label <- mkLabel f
-    let jsrCode = [JSR (Label label)]
-        returnCode = [SET (Reg r) (Reg "A")]
+    jsrCode <- case (tf,f) of
+        (TypeFunction _ _, Var name) -> do
+            label <- mkLabel name
+            return [JSR (Label label)]
+        (TypePointer (TypeFunction _ _), x) -> do
+            pr <- getReg
+            ptrCode <- compileExpr x pr
+            freeReg pr
+            return $ ptrCode ++ [JSR (Reg pr)]
+        (t_, f_) -> error $ "Bad case: t = " ++ show t_ ++ ", f = " ++ show f_
+
+    let returnCode = [SET (Reg r) (Reg "A")]
 
     return $ saveCode ++ argCode ++ jsrCode ++ returnCode ++ restoreCode
-
-compileExpr (Call _ _) _ = error "Function pointers are not supported, the function used in a call must be an identifier."
 
 -- creating an array with a length
 compileExpr (BuiltinCall LNew (Just (TypeArray t)) (n:_)) r = do
@@ -835,7 +858,7 @@ compileExpr (BuiltinCall LNew (Just (TypeArray t)) (n:_)) r = do
     return $ saveCode ++ lengthCode ++
              [SET (Reg "A") (Lit size),
               MUL (Reg "A") (Reg r),          -- size in words
-              JSR (Label "heap.alloc")] ++    -- pointer is stored in A
+              JSR (AddrLit 9)] ++    -- pointer is stored in A
              (if r /= "A" then [SET (Reg r) (Reg "A")] else []) ++
              restoreCode
 
@@ -844,7 +867,7 @@ compileExpr (BuiltinCall LNew (Just t) _) r = do
     size <- typeSize t
     return $ saveCode ++
              [SET (Reg "A") (Lit size),
-              JSR (Label "heap.alloc")] ++ -- pointer is stored in A
+              JSR (AddrLit 9)] ++ -- pointer is stored in A
              (if r /= "A" then [SET (Reg r) (Reg "A")] else []) ++
              restoreCode
 
@@ -854,7 +877,7 @@ compileExpr (BuiltinCall LDelete Nothing [x]) _ = do
     (saveCode, restoreCode) <- saveRegsForCall "_" -- placeholder
     -- the type has already been checked, so just call it.
     expCode <- compileExpr x "A"
-    return $ saveCode ++ expCode ++ [JSR (Label "heap.free")] ++ restoreCode
+    return $ saveCode ++ expCode ++ [JSR (AddrLit 10)] ++ restoreCode
 
 compileExpr (BuiltinCall LDelete _ _) _ = typeError "delete() must be called with exactly one pointer."
 

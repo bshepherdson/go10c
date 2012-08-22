@@ -182,6 +182,12 @@ Type : TypeName         { $1 }
      | TypeLit          { $1 }
      | OP Type CP       { $2 }
 
+NonPointerType :: { Type }
+NonPointerType : TypeName       { $1 }
+               | ArrayType      { $1 }
+               | StructType     { $1 }
+               | FunctionType   { $1 }
+               | OP Type CP     { $2 }
 
 
 Declaration :: { [Statement] }
@@ -443,7 +449,7 @@ Call : OP ExpressionList CP         { reverse $2 }
      | OP CP                        { [] }
 
 Conversion :: { Expr }
-Conversion : Type OP Expression CP              { Conversion $1 $3 }
+Conversion : NonPointerType OP Expression CP              { Conversion $1 $3 }
 
 BuiltinCall :: { Expr }
 BuiltinCall : BuiltinName OP CP                       { BuiltinCall $1 Nothing [] }
@@ -460,8 +466,8 @@ Expression :: { Expr }
 Expression : BinaryExpr                         { $1 }
 
 UnaryExpr :: { Expr }
-UnaryExpr : PrimaryExpr                         { $1 }
-          | UnaryOp UnaryExpr                   { UnOp $1 $2 }
+UnaryExpr : UnaryOp UnaryExpr                   { UnOp $1 $2 }
+          | PrimaryExpr                         { $1 }
 
 BinaryExpr :: { Expr }
 BinaryExpr : BinaryExpr '||' BinaryExpr1        { BinOp (LOp "||") $1 $3 }
