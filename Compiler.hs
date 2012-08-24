@@ -9,7 +9,7 @@ import Control.Monad
 import Control.Monad.State.Strict
 
 import Control.Applicative
-import Control.Arrow (first)
+import Control.Arrow (first, second)
 
 import qualified Data.Map as M
 import Data.Maybe (isJust, isNothing, fromMaybe)
@@ -173,7 +173,7 @@ doCompile :: SourceFile -> [String] -> IO [Asm]
 doCompile (SourceFile thePackage imports statements_) libdirs = do
     -- handle the imports
     allImports <- evalStateT (importsClosure imports (if null libdirs then ["."] else libdirs)) []
-    let statements = allImports ++ statements_
+    let statements = allImports ++ fixSelectors statements_
     let allGlobals = findVariables statements
         allTypes = M.fromList $ findTypes statements ++ builtinTypes
         globalCode = flip concatMap allGlobals $ \(QualIdent mp i, t) -> [LabelDef (mkLabelInternal (fromMaybe thePackage mp) i)] ++ replicate (typeSizeInternal allTypes t) (DAT "0") -- include the label and enough space for the global
@@ -315,8 +315,43 @@ findVariables (_:rest) = findVariables rest
 -- finds type declarations in a list of statements, intended for use on a whole file.
 findTypes :: [Statement] -> [(QualIdent, Type)]
 findTypes [] = []
-findTypes (StmtTypeDecl s t : rest) = (s, t) : findTypes rest
+findTypes (StmtTypeDecl s t : rest) = case t of
+    (TypeStruct fields) -> if null (filter (isUpper.head.fst) fields) then (s, t) : findTypes rest else error "Struct fields must begin with a lowercase letter."
+    _ -> (s, t) : findTypes rest
 findTypes (_:rest) = findTypes rest
+
+
+-- Finds every Var expression in the file, converting it to a Selector if the letter after the . is lowercase.
+mapExpressions :: (Expr -> Expr) -> [Statement] -> [Statement]
+mapExpressions f (StmtVarDecl i t (Just x) : rest) = StmtVarDecl i t (Just (f x)) : mapExpressions f rest
+mapExpressions f (StmtShortVarDecl i x : rest) = StmtShortVarDecl i (f x) : mapExpressions f rest
+mapExpressions f (StmtFunction i args ret (Just stmts) : rest) = StmtFunction i args ret (Just (mapExpressions f stmts)) : mapExpressions f rest
+mapExpressions f (StmtExpr x : rest) = StmtExpr (f x) : mapExpressions f rest
+mapExpressions f (StmtInc x : rest) = StmtInc (f x) : mapExpressions f rest
+mapExpressions f (StmtDec x : rest) = StmtDec (f x) : mapExpressions f rest
+mapExpressions f (StmtAssignment s lv rv : rest) = StmtAssignment s (f lv) (f rv) : mapExpressions f rest
+mapExpressions f (StmtIf initializer condition ifbody elsebody : rest) =
+    StmtIf (mapExpressions f initializer) (f condition) (mapExpressions f ifbody) (mapExpressions f elsebody) : mapExpressions f rest
+mapExpressions f (StmtFor initializer condition incrementer body : rest) =
+    StmtFor (mapExpressions f initializer) (f condition) (mapExpressions f incrementer) (mapExpressions f body) : mapExpressions f rest
+mapExpressions f (StmtSwitch initializer switcher cases : rest) = StmtSwitch (mapExpressions f initializer) (f switcher) (map (\(xs, stmts) -> (map f xs, mapExpressions f stmts)) cases) : mapExpressions f rest
+mapExpressions f (StmtReturn (Just x) : rest) = StmtReturn (Just (f x)) : mapExpressions f rest
+mapExpressions f (s:rest) = s : mapExpressions f rest
+mapExpressions _ [] = []
+
+
+fixSelectors :: [Statement] -> [Statement]
+fixSelectors = mapExpressions fixer
+    where fixer (Var (QualIdent (Just p) n)) | not (isUpper (head n)) = Selector (Var (QualIdent Nothing p)) n
+          fixer (LitComposite t vals) = LitComposite t (map (second fixer) vals)
+          fixer (Selector x s) = Selector (fixer x) s
+          fixer (Index x i) = Index (fixer x) (fixer i)
+          fixer (Call f args) = Call (fixer f) (map fixer args)
+          fixer (BuiltinCall t mt args) = BuiltinCall t mt (map fixer args)
+          fixer (Conversion t x) = Conversion t (fixer x)
+          fixer (UnOp t x) = UnOp t (fixer x)
+          fixer (BinOp t l r) = BinOp t (fixer l) (fixer r)
+          fixer x = x
 
 
 -- returns a free register to be used in an expression.
@@ -370,8 +405,13 @@ typeCheck (LitComposite t _) = return t
 typeCheck (Var i) = lookupSymbol i
 typeCheck (Selector x field) = do
     xt <- typeCheck x
-    case xt of
+    ut <- underlyingType xt
+    case ut of
         (TypeStruct fields) -> case filter ((==field) . fst) fields of
+            []      -> typeError $ "Struct does not have a field named '" ++ field ++ "'."
+            [(_,t)] -> return t
+            _       -> error $ "The impossible just happened! Struct with multiple fields named '" ++ field ++ "'."
+        (TypePointer (TypeStruct fields)) -> case filter ((==field) . fst) fields of
             []      -> typeError $ "Struct does not have a field named '" ++ field ++ "'."
             [(_,t)] -> return t
             _       -> error $ "The impossible just happened! Struct with multiple fields named '" ++ field ++ "'."
@@ -408,7 +448,12 @@ typeCheck (BuiltinCall LNew (Just (TypeArray t)) [n]) = do
 
 typeCheck (BuiltinCall LNew (Just (TypeArray t)) _) = typeError $ "new() called to create an array but no size was provided"
 typeCheck (BuiltinCall LNew (Just t) _) = return (TypePointer t) -- otherwise create a pointer to the provided type (TODO does this work for strings?)
-typeCheck (BuiltinCall LNew Nothing _)  = typeError $ "new() must have a type provided as the first argument."
+typeCheck (BuiltinCall LNew Nothing [Var t]) = do
+    ut <- underlyingType (TypeName t)
+    case ut of
+        (TypeArray _) -> typeError $ "new() called to create an array but no size was provided."
+        ty -> return (TypePointer ty)
+
 typeCheck (BuiltinCall LDelete Nothing [x]) = do
     t <- typeCheck x
     ut <- underlyingType t
@@ -518,6 +563,16 @@ typeSize t = do
     return $ typeSizeInternal ts t
 
 
+fieldOffset :: [(String, Type)] -> String -> Compiler Int
+fieldOffset fields name = fieldOffset' fields name 0
+    where fieldOffset' [] name _ = compileError $ "No field named '" ++ name ++ "' found on struct."
+          fieldOffset' ((s, t):rest) name offset
+            | s == name = return offset
+            | otherwise = do
+                size <- typeSize t
+                fieldOffset' rest name (offset+size)
+
+
 isPointer :: Type -> Bool
 isPointer (TypePointer _) = True
 isPointer _ = False
@@ -597,7 +652,7 @@ lookupType i = do
 -- Should not add symbols to the table on a TypeDecl or VarDecl. They should have been added by the scan performed when beginning a block/file.
 -- Initializers for variables should still be compiled in place (because they might depend on the values of other variables).
 compile :: Statement -> Compiler [Asm]
-compile (StmtTypeDecl name t) = error "TypeDecls are not to be compiled."
+compile (StmtTypeDecl name t) = return [] -- nothing to compile for typedecls.
 
 -- note that this doesn't add the symbol, but rather expects it to already exist. this does compile initializers, though.
 compile (StmtVarDecl name t Nothing) = addSymbol name t >> return [] -- nothing to do for a plain declaration
@@ -669,7 +724,7 @@ compile (StmtExpr x@(BuiltinCall _ _ _)) = do
 compile (StmtExpr x) = error $ "Suspicious code. Expression " ++ show x ++ " has no side effects."
 
 compile (StmtInc x) = compileIncDec ADD x
-compile (StmtDec x) = compileIncDec SUB x 
+compile (StmtDec x) = compileIncDec SUB x
 
 compile (StmtAssignment Nothing lvalue rvalue) = do
     when (not $ isLvalue lvalue) $ compileError $ "Attempt to assign to non-lvalue " ++ show lvalue
@@ -681,12 +736,39 @@ compile (StmtAssignment Nothing lvalue rvalue) = do
     -- if we get down here, then this assignment is legal, so compile it.
     r <- getReg
     exprCode <- compileExpr rvalue r
-    freeReg r
-    case lvalue of
+    code <- case lvalue of
         (Var i) -> do
             locCode <- lookupLocation i >>= compileLocation
             return $ exprCode ++ [SET locCode (Reg r)]
-        _ -> error "Not implemented: Assigning to lvalues other than straight variables." -- TODO implement
+
+        (Index x i) -> do
+            rx <- getReg
+            xCode <- compileExpr x rx
+            ri <- getReg
+            iCode <- compileExpr i ri
+            freeReg rx
+            freeReg ri
+            (TypeArray elementType) <- underlyingType =<< typeCheck x
+            size <- typeSize elementType
+            return $ exprCode ++ [MUL (Reg ri) (Lit size), ADD (Reg rx) (Reg ri), SET (AddrReg rx) (Reg r)]
+
+        (Selector x s) -> do
+            t <- typeCheck x
+            ut <- underlyingType t
+            fields <- case ut of
+                (TypeStruct fields) -> return fields
+                (TypePointer (TypeStruct fields)) -> return fields
+                _ -> typeError $ "Attempt to select a field from a non-struct value of type " ++ show t
+            offset <- fieldOffset fields s
+
+            rx <- getReg
+            xCode <- compileExpr x rx
+            freeReg rx
+            return $ exprCode ++ xCode ++ [ADD (Reg rx) (Lit offset), SET (AddrReg rx) (Reg r)]
+
+        _ -> error "Not implemented: Assigning to lvalues other than variables, array elements or struct fields."
+    freeReg r
+    return code
 
 -- TODO: Optimization: some ops, like += and -=, can be optimized by using ADD instead of computing and setting. Priority low, though, only a couple of instructions wasted.
 compile (StmtAssignment (Just op) lvalue rvalue) = compile (StmtAssignment Nothing lvalue (BinOp (LOp op) lvalue rvalue))
@@ -813,7 +895,17 @@ compileExpr (Var i) r = do
     loc <- lookupLocation i >>= compileLocation
     return [SET (Reg r) loc]
 
-compileExpr (Selector _ _) _ = error "Selectors not implemented"
+compileExpr (Selector x s) r = do
+    t <- typeCheck x
+    ut <- underlyingType t
+    fields <- case ut of
+        (TypeStruct fields) -> return fields
+        (TypePointer (TypeStruct fields)) -> return fields
+        _ -> typeError $ "Attempt to select field '" ++ s ++ "' from non-struct type " ++ show t
+    xCode <- compileExpr x r
+    offset <- fieldOffset fields s
+    return $ xCode ++ [ADD (Reg r) (Lit offset), SET (Reg r) (AddrReg r)]
+
 
 compileExpr (Index arr ix) r = do
     arrType <- typeCheck arr
@@ -863,8 +955,19 @@ compileExpr (BuiltinCall LNew (Just (TypeArray t)) (n:_)) r = do
              restoreCode
 
 compileExpr (BuiltinCall LNew (Just t) _) r = do
+    ut <- underlyingType t
     (saveCode, restoreCode) <- saveRegsForCall r
-    size <- typeSize t
+    size <- typeSize ut
+    return $ saveCode ++
+             [SET (Reg "A") (Lit size),
+              JSR (AddrLit 9)] ++ -- pointer is stored in A
+             (if r /= "A" then [SET (Reg r) (Reg "A")] else []) ++
+             restoreCode
+
+compileExpr (BuiltinCall LNew Nothing [Var t]) r = do
+    ut <- underlyingType (TypeName t)
+    (saveCode, restoreCode) <- saveRegsForCall r
+    size <- typeSize ut
     return $ saveCode ++
              [SET (Reg "A") (Lit size),
               JSR (AddrLit 9)] ++ -- pointer is stored in A
@@ -944,7 +1047,16 @@ compileExpr (UnOp (LOp "&") x) r = do
             return $ xCode ++ iCode ++
                      (if size > 1 then [MUL (Reg ir) (Lit size)] else []) ++
                      [ADD (Reg r) (Reg ir)]
-        (Selector _ _) -> compileError $ "Struct selectors are not implemented."
+        (Selector x s) -> do
+            t <- typeCheck x
+            ut <- underlyingType t
+            fields <- case ut of
+                (TypeStruct fields) -> return fields
+                _ -> typeError $ "Attempt to access fields of non-struct value. Actual type is " ++ show t
+            offset <- fieldOffset fields s
+            xCode <- compileExpr x r
+            return $ xCode ++ [ADD (Reg r) (Lit offset)]
+
         x -> typeError "Cannot take the address of this value."
 
 
