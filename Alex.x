@@ -2,6 +2,7 @@
 module GoLexer where
 
 import Numeric (readOct, readHex)
+import Data.Char (chr)
 import qualified Data.Map as M
 }
 
@@ -169,6 +170,12 @@ stringEscapes = M.insert '"' '"' baseEscapes
 -- collapses literal backslashes in the string into escape characters
 escape :: M.Map Char Char -> String -> String
 escape _ [] = []
+escape m ('\\':a:b:c:rest) | a == 'x' = case readHex (b:c:[]) of
+                                            [(x,[])] -> chr x : escape m rest
+                                            _ -> error $ "Broken hex escape character: " ++ ['\\',a,b,c]
+                           | a `elem` "012" = case readOct (a:b:c:[]) of
+                                                  [(x,[])] -> chr x : escape m rest
+                                                  _ -> error $ "Broken octal escape character: " ++ ['\\',a,b,c]
 escape m ('\\':c:s) = case M.lookup c m of
     Just esc -> esc : escape m s
     Nothing  -> error $ "Illegal escape character: \\" ++ [c]

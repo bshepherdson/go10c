@@ -5,6 +5,7 @@ This file lists optimizations I have observed that can be made in the generated 
     * Literal values don't need to be placed in new registers, but should be folded into the following instruction.
     * It will copy from argument registers to the expression return registers before computing their values.
     * Fixing that is much more difficult than it seems at first, though.
+* Returns that don't involve using `A` can be optimized to just set the value in `A`.
 * Don't `SET PC, _go10c_foo_done` when that label immediately follows (in code for `return`)
 * `A, B, C` are being saved in functions, when they need not be. If they're arguments they get saved even if they're not used again later.
 * main() can skip the frame pointer stuff at top and bottom. It still needs to make room for locals, though.
@@ -16,4 +17,6 @@ This file lists optimizations I have observed that can be made in the generated 
 * Multiple `SET PC, ...` lines in a row can be elided.
 * Negative integer literals could be compiled directly and/or optimized into one instruction instead of 3.
 * Empty functions can be optimized into a single `SET PC, POP`
+* Integer negation and other literal expressions can be computed at compile time.
+* Arguments bound for the same place need not be pushed and popped.
 

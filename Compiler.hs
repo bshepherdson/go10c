@@ -432,8 +432,8 @@ typeCheck (Selector x field) = do
         _ -> typeError $ "Attempt to select a field from a non-struct value " ++ show x ++ ", type " ++ show xt
 
 typeCheck (Index x i) = do
-    arrType <- typeCheck x
-    indexType <- typeCheck i
+    arrType <- underlyingType =<< typeCheck x
+    indexType <- underlyingType =<< typeCheck i
     case (arrType, indexType) of
         (TypeArray t, TypeInt) -> return t
         (TypeArray t, TypeUint) -> return t
@@ -792,7 +792,7 @@ compile (StmtAssignment Nothing lvalue rvalue) = do
             freeReg ri
             (TypeArray elementType) <- underlyingType =<< typeCheck x
             size <- typeSize elementType
-            return $ exprCode ++ [MUL (Reg ri) (Lit size), ADD (Reg rx) (Reg ri), SET (AddrReg rx) (Reg r)]
+            return $ exprCode ++ xCode ++ iCode ++ [MUL (Reg ri) (Lit size), ADD (Reg rx) (Reg ri), SET (AddrReg rx) (Reg r)]
 
         (Selector x s) -> do
             t <- typeCheck x
@@ -959,9 +959,10 @@ compileExpr (Index arr ix) r = do
     ixR <- getReg
     ixCode <- compileExpr ix ixR
     freeReg ixR
-    return $ arrCode ++ ixCode ++
+    let ret = arrCode ++ ixCode ++
              (if size > 1 then [MUL (Reg ixR) (Lit size)] else []) ++ -- if the size of the array elements is > 1, multiply from the index to the offset. TODO optimization trivial: shift for sizes that are powers of 2.
              [ADD (Reg r) (Reg ixR), SET (Reg r) (AddrReg r)]
+    return ret
 
 compileExpr (Call f args) r = do
     when (length args >= 4) $ error "Functions with more than 3 arguments are not implemented."
@@ -1123,10 +1124,15 @@ compileExpr (BinOp (LOp ">>") left right) r = compileIntegralBinOp SHR ASR ">>" 
 compileExpr (BinOp (LOp "==") left right) r = compileEqBinOp IFE "==" left right r
 compileExpr (BinOp (LOp "!=") left right) r = compileEqBinOp IFN "!=" left right r
 
+compileExpr (BinOp (LOp "||") left right) r = compileLogicalBinOp BOR "||" left right r
+compileExpr (BinOp (LOp "&&") left right) r = compileLogicalBinOp AND "&&" left right r
+
 compileExpr (BinOp (LOp ">") left right) r = compileComparisonOp IFG IFA ">" id left right r
 compileExpr (BinOp (LOp "<") left right) r = compileComparisonOp IFL IFU "<" id left right r
 compileExpr (BinOp (LOp ">=") left right) r = compileComparisonOp IFL IFU ">=" swap left right r -- >= is < with the arguments swapped
 compileExpr (BinOp (LOp "<=") left right) r = compileComparisonOp IFG IFA "<=" swap left right r -- <= is > with the arguments swapped
+
+compileExpr x r = compileError $ "Unknown expression: " ++ show x
 
 
 -- helper function for integral type binary operations like +, -, | and <<
@@ -1164,6 +1170,19 @@ compileEqBinOp opCode opName left right r = do
              opCode (Reg r) (Reg rr),
              SET EX (Lit 1),
              SET (Reg r) EX]
+
+compileLogicalBinOp :: Opcode -> String -> Expr -> Expr -> String -> Compiler [Asm]
+compileLogicalBinOp opCode opName left right r = do
+    [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
+    when (leftType /= TypeBool) $ typeError $ opName ++ " can only be applied to boolean values, but left argument has type " ++ show leftType
+    when (rightType /= TypeBool) $ typeError $ opName ++ " can only be applied to boolean values, but right argument has type " ++ show rightType
+
+    leftCode <- compileExpr left r
+    rr <- getReg
+    rightCode <- compileExpr right rr
+    freeReg rr
+
+    return $ leftCode ++ rightCode ++ [opCode (Reg r) (Reg rr)]
 
 
 -- helper function for comparison operators >, <, <=, >=
