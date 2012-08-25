@@ -240,13 +240,17 @@ seenImport i = do
 -- note that only functions and globals (and constants) with uppercase first letters are exported.
 exportedStatements :: String -> [Statement] -> [Statement]
 exportedStatements _ [] = []
-exportedStatements pkg (StmtTypeDecl (QualIdent Nothing i) t : rest) | isUpper (head i) = StmtTypeDecl (QualIdent (Just pkg) i) t : exportedStatements pkg rest
+exportedStatements pkg (StmtTypeDecl (QualIdent Nothing i) t : rest) | isUpper (head i) = StmtTypeDecl (QualIdent (Just pkg) i) (exportedType pkg t) : exportedStatements pkg rest
 exportedStatements pkg (StmtVarDecl (QualIdent Nothing i)  t x : rest) | isUpper (head i) = StmtVarDecl  (QualIdent (Just pkg) i) t x : exportedStatements pkg rest
 exportedStatements pkg (StmtConstDecl (QualIdent Nothing i)  mt x : rest) | isUpper (head i) = StmtConstDecl  (QualIdent (Just pkg) i) mt x : exportedStatements pkg rest
 exportedStatements pkg (StmtShortVarDecl (QualIdent Nothing i) x : rest) | isUpper (head i) = StmtShortVarDecl (QualIdent (Just pkg) i) x : exportedStatements pkg rest
 exportedStatements pkg (StmtFunction (QualIdent Nothing i) args ret _ : rest) | isUpper (head i) = StmtFunction (QualIdent (Just pkg) i) args ret Nothing : exportedStatements pkg rest
 exportedStatements pkg (_:rest) = exportedStatements pkg rest
 
+exportedType :: String -> Type -> Type
+exportedType pkg (TypeStruct fields) = TypeStruct $ map (second $ exportedType pkg) fields
+exportedType pkg (TypeName (QualIdent Nothing t)) | not (t `elem` ["int", "uint", "char", "string", "bool"]) = TypeName (QualIdent (Just pkg) t)
+exportedType _ t = t
 
 -- All built-in types: int, uint, char, string, bool.
 builtinTypes :: [(QualIdent, Type)]
@@ -319,8 +323,8 @@ findVariables (_:rest) = findVariables rest
 -- finds constants with a shallow search. intended to find global constants in the whole file.
 findConstants :: [Statement] -> [(QualIdent, Location)]
 findConstants [] = []
-findConstants (StmtConstDecl i@(QualIdent Nothing _) _ (Just (LitInt x)) : rest) = (i, LocConstant x) : findConstants rest
-findConstants (StmtConstDecl i@(QualIdent Nothing _) _ (Just _) : rest) = compileError $ "Only integer literals are supported as contants."
+findConstants (StmtConstDecl i _ (Just (LitInt x)) : rest) = (i, LocConstant x) : findConstants rest
+findConstants (StmtConstDecl i _ (Just _) : rest) = compileError $ "Only integer literals are supported as contants."
 findConstants (StmtConstDecl _ _ Nothing : rest) = compileError $ "const declarations must include a value"
 findConstants (_:rest) = findConstants rest
 
@@ -458,7 +462,7 @@ typeCheck (Call f args) = do
             let mismatched = map snd $ dropWhile fst $ zip assigns zipped
             case mismatched of
                 [] -> return returnType -- function call is legal
-                ((expected, actual):_) -> typeError $ "Function call expected an argument of type " ++ show expected ++ " but got " ++ show actual ++ "."
+                ((expected, actual):_) -> typeError $ "Function call (" ++ show f ++ ") expected an argument of type " ++ show expected ++ " but got " ++ show actual ++ "."
 
 
 typeCheck (BuiltinCall LNew (Just (TypeArray t)) [n]) = do
@@ -1192,6 +1196,8 @@ compileComparisonOp unsignedOp signedOp opName switchOps left right r = do
     op <- case (leftType, rightType) of
         (TypeInt, TypeInt) -> return signedOp
         (TypeUint, TypeUint) -> return unsignedOp
+        (TypeInt, TypeUint) -> return unsignedOp
+        (TypeUint, TypeInt) -> return unsignedOp
         (TypeChar, TypeChar) -> return unsignedOp
         _ -> typeError $ opName ++ " can only be used on matching integral or char types, not " ++ show leftType ++ " and " ++ show rightType
     leftCode <- compileExpr left r
