@@ -63,7 +63,7 @@ data CompilerState = CS {
     } deriving (Show)
 
 data Location = LocReg String
-              | LocStack Int -- places above the stack pointer
+              | LocStack Int -- places above the frame pointer, J
               | LocLabel String -- in the given label
     deriving (Show)
 
@@ -951,7 +951,10 @@ compileExpr (Call f args) r = do
     tf <- typeCheck f
 
     (saveCode, restoreCode) <- saveRegsForCall r
-    argCode <- concat <$> sequence (zipWith compileExpr args ["A", "B", "C"])
+    ra <- getReg
+    argCode <- concatMap (++ [SET PUSH (Reg ra)]) <$> sequence (map (flip compileExpr ra) args)
+    let popArgsCode = reverse $ zipWith (\r _ -> SET (Reg r) POP) ["A", "B", "C"] args
+    freeReg ra
     jsrCode <- case (tf,f) of
         (TypeFunction _ _, Var name) -> do
             label <- mkLabel name
@@ -965,7 +968,7 @@ compileExpr (Call f args) r = do
 
     let returnCode = [SET (Reg r) (Reg "A")]
 
-    return $ saveCode ++ argCode ++ jsrCode ++ returnCode ++ restoreCode
+    return $ saveCode ++ argCode ++ popArgsCode ++ jsrCode ++ returnCode ++ restoreCode
 
 -- creating an array with a length
 compileExpr (BuiltinCall LNew (Just (TypeArray t)) (n:_)) r = do
@@ -1175,8 +1178,8 @@ regsToSave r = do
 saveRegsForCall :: String -> Compiler ([Asm], [Asm])
 saveRegsForCall r = do
     rs <- regsToSave r
-    return (map (SET PUSH . Reg) rs,
-            map (\r -> SET (Reg r) POP) (reverse rs))
+    return (map (SET PUSH . Reg) (reverse rs),
+            map (\r -> SET (Reg r) POP) rs)
 
 
 isLvalue :: Expr -> Bool
