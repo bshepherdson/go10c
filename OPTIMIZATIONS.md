@@ -6,7 +6,7 @@ This file lists optimizations I have observed that can be made in the generated 
     * It will copy from argument registers to the expression return registers before computing their values.
     * Fixing that is much more difficult than it seems at first, though.
 * Don't `SET PC, _go10c_foo_done` when that label immediately follows (in code for `return`)
-* `A, B, C` are being saved in functions, when they need not be.
+* `A, B, C` are being saved in functions, when they need not be. If they're arguments they get saved even if they're not used again later.
 * main() can skip the frame pointer stuff at top and bottom. It still needs to make room for locals, though.
 * Plenty of `SET A, A`s are being generated.
 * Consider a last-minute pass over the assembly to remove known no-ops like `SET A, A` and `ADD/SUB A, 0` and others.

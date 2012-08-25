@@ -527,6 +527,7 @@ UnaryOp : '+'   { $1 }
 {
 
 data Type = TypeName QualIdent
+          | TypeNil
           | TypeBool
           | TypeChar
           | TypeInt

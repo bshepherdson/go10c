@@ -397,11 +397,12 @@ typeError = error
 
 -- typechecks an expression, returning its Type or printing a type error and exiting.
 typeCheck :: Expr -> Compiler Type
-typeCheck (LitInt _) = return TypeInt
+typeCheck (LitInt _) = return TypeUint
 typeCheck (LitChar _) = return TypeChar
 typeCheck (LitBool _) = return TypeBool
 typeCheck (LitString _) = return TypeString
 typeCheck (LitComposite t _) = return t
+typeCheck (Var (QualIdent Nothing "nil")) = return TypeNil
 typeCheck (Var i) = lookupSymbol i
 typeCheck (Selector x field) = do
     xt <- typeCheck x
@@ -422,7 +423,13 @@ typeCheck (Index x i) = do
     indexType <- typeCheck i
     case (arrType, indexType) of
         (TypeArray t, TypeInt) -> return t
+        (TypeArray t, TypeUint) -> return t
         (TypeArray _, t) -> typeError $ "Array index has type " ++ show t ++ ", not an integer."
+
+        (TypeName t@(QualIdent Nothing "string"), TypeInt) -> return TypeChar
+        (TypeName t@(QualIdent Nothing "string"), TypeUint) -> return TypeChar
+        (TypeName (QualIdent Nothing "string"), t) -> typeError $ "Array index has type " ++ show t ++ ", not an integer."
+
         (t, _) -> typeError $ "Attempt to index non-array type " ++ show t ++ "."
 
 typeCheck (Call f args) = do
@@ -434,7 +441,8 @@ typeCheck (Call f args) = do
   where check argTypes returnType = do
             providedArgTypes <- mapM typeCheck args
             let zipped = zip argTypes providedArgTypes
-                mismatched = dropWhile (uncurry (==)) zipped
+            assigns <- sequence $ map (uncurry assignable) zipped
+            let mismatched = map snd $ dropWhile fst $ zip assigns zipped
             case mismatched of
                 [] -> return returnType -- function call is legal
                 ((expected, actual):_) -> typeError $ "Function call expected an argument of type " ++ show expected ++ " but got " ++ show actual ++ "."
@@ -477,8 +485,10 @@ typeCheck (UnOp (LOp op) x) = let
                 _       -> typeError $ "Unary " ++ op ++ " expects an int, found " ++ show xt
     in  case op of
             "+" -> unopInt
-            "-" -> unopInt
             "^" -> unopInt
+            "-" -> case x of
+                (LitInt _) -> return TypeInt
+                t -> unopInt
             "!" -> do
                 xt <- typeCheck x
                 case xt of
@@ -535,7 +545,8 @@ typeCheckBinOp op actLeft expLeft actRight expRight retType = do
 
 typeCheckEqOp :: String -> Type -> Type -> Compiler Type
 typeCheckEqOp op left right = do
-    when (left /= right) $ typeError $ "Arguments to " ++ op ++ " have mismatched types:\n\tLeft: " ++ show left ++ "\n\tRight: " ++ show right
+    ass <- assignable left right
+    when (not ass) $ typeError $ "Arguments to " ++ op ++ " have mismatched types:\n\tLeft: " ++ show left ++ "\n\tRight: " ++ show right
     return TypeBool
 
 
@@ -579,6 +590,7 @@ isPointer _ = False
 
 isArray :: Type -> Bool
 isArray (TypeArray _) = True
+isArray TypeString = True
 isArray _ = False
 
 -- return True if the first type can be converted into the second.
@@ -630,12 +642,23 @@ assignable from to
         case (uFrom == uTo, from, to) of
             (True, TypeName _, TypeName _) -> return False -- at least one must be non-named
             (True, _, _) -> return True -- at least one is non-named and their base types are identical.
-            _ -> return False
--- TODO: Handle nil
+            _ -> case (uFrom, uTo) of
+                (TypeInt, TypeUint) -> return True
+                (TypeUint, TypeInt) -> return True
+                (TypeNil, TypePointer _) -> return True
+                (TypeString, TypePointer TypeChar) -> return True
+                (TypePointer TypeChar, TypeString) -> return True
+                (TypeArray TypeChar, TypeString) -> return True
+                (TypeString, TypeArray TypeChar) -> return True
+                _ -> return False
 
 
 underlyingType :: Type -> Compiler Type
+underlyingType TypeString = return $ TypeArray TypeChar
 underlyingType (TypeName t) = lookupType t >>= underlyingType
+underlyingType (TypePointer TypeChar) = return $ TypeArray TypeChar
+underlyingType (TypePointer t) = TypePointer <$> underlyingType t
+underlyingType (TypeArray t) = TypeArray <$> underlyingType t
 underlyingType t = return t
 
 
@@ -731,7 +754,7 @@ compile (StmtAssignment Nothing lvalue rvalue) = do
     lt <- typeCheck lvalue
     rt <- typeCheck rvalue
     assign <- assignable rt lt
-    when (not $ assign) $ typeError $ "Right side of assignment is not assignable to left side.\n\tLeft: " ++ show lt ++ "\n\tRight: " ++ show rt
+    when (not assign) $ typeError $ "Right side of assignment is not assignable to left side.\n\tLeft: " ++ show lt ++ "\n\tRight: " ++ show rt
 
     -- if we get down here, then this assignment is legal, so compile it.
     r <- getReg
@@ -891,6 +914,8 @@ compileExpr (LitString s) r = do
 
 compileExpr (LitComposite _ _) _ = error "Composite literals not implemented"
 
+compileExpr (Var (QualIdent Nothing "nil")) r = return [SET (Reg r) (Lit 0)]
+
 compileExpr (Var i) r = do
     loc <- lookupLocation i >>= compileLocation
     return [SET (Reg r) loc]
@@ -1032,7 +1057,7 @@ compileExpr (UnOp (LOp "&") x) r = do
         (Index x i) -> do
             xt <- typeCheck x
             xut <- underlyingType xt
-            when (not (isArray xut)) $ typeError $ "Attempt to index non-array value of type " ++ show xt
+            when (not (isArray xut)) $ typeError $ "Attempt to index non-array value of type " ++ show xt ++ ", " ++ show xut
             let (TypeArray elementType) = xut
             it <- typeCheck i
             iut <- underlyingType it
@@ -1100,7 +1125,8 @@ compileIntegralBinOp unsignedOp signedOp opName left right r = do
 compileEqBinOp :: Opcode -> String -> Expr -> Expr -> String -> Compiler [Asm]
 compileEqBinOp opCode opName left right r = do
     [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
-    when (leftType /= rightType) $ typeError $ opName ++ " can only be used on matching integral or char types, not " ++ show leftType ++ " and " ++ show rightType
+    ass <- assignable leftType rightType
+    when (not ass) $ typeError $ opName ++ " can only be used on matching integral or char types, not " ++ show leftType ++ " and " ++ show rightType
 
     leftCode <- compileExpr left r
     rr <- getReg
