@@ -522,6 +522,9 @@ typeCheck (BinOp (LOp op) left right) = do
             case (leftType, rightType) of
                 (TypeString, TypeString) -> return TypeString
                 (TypeInt, TypeInt) -> return TypeInt
+                (TypeUint, TypeUint) -> return TypeUint
+                (TypeInt, TypeUint) -> return TypeUint
+                (TypeUint, TypeInt) -> return TypeUint
                 _ -> do
                     when (leftType /= TypeInt && leftType /= TypeString) $ typeError $ "Left argument of + must be int or string, but found " ++ show leftType
                     when (rightType /= TypeInt && rightType /= TypeString) $ typeError $ "right argument of + must be int or string, but found " ++ show rightType
@@ -552,8 +555,10 @@ typeCheck (BinOp (LOp op) left right) = do
 
 typeCheckBinOp :: String -> Type -> Type -> Type -> Type -> Type -> Compiler Type
 typeCheckBinOp op actLeft expLeft actRight expRight retType = do
-    when (actLeft /= expLeft) $ typeError $ "Left argument of " ++ op ++ " expected " ++ show expLeft ++ " but found " ++ show actLeft ++ "."
-    when (actRight /= expRight) $ typeError $ "Right argument of " ++ op ++ " expected " ++ show expRight ++ " but found " ++ show actRight ++ "."
+    leftAssign <- assignable actLeft expLeft
+    rightAssign <- assignable actRight expRight
+    when (not leftAssign) $ typeError $ "Left argument of " ++ op ++ " expected " ++ show expLeft ++ " but found " ++ show actLeft ++ "."
+    when (not rightAssign) $ typeError $ "Right argument of " ++ op ++ " expected " ++ show expRight ++ " but found " ++ show actRight ++ "."
     return retType
 
 typeCheckEqOp :: String -> Type -> Type -> Compiler Type
@@ -1131,6 +1136,8 @@ compileIntegralBinOp unsignedOp signedOp opName left right r = do
     op <- case (leftType, rightType) of
         (TypeInt, TypeInt) -> return signedOp
         (TypeUint, TypeUint) -> return unsignedOp
+        (TypeUint, TypeInt) -> return unsignedOp
+        (TypeInt, TypeUint) -> return unsignedOp
         (TypeChar, TypeChar) -> return unsignedOp
         _ -> typeError $ opName ++ " can only be used on matching integral or char types, not " ++ show leftType ++ " and " ++ show rightType
 
