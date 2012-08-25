@@ -914,11 +914,9 @@ compileIncDec :: (Arg -> Arg -> Asm) -> Expr -> Compiler [Asm]
 compileIncDec opcode (Var i) = do
     xt <- typeCheck (Var i)
     xut <- underlyingType xt
-    case xut of
-        TypeInt -> do
-            locCode <- lookupLocation i >>= compileLocation
-            return [opcode locCode (Lit 1)]
-        _ -> typeError $ "Attempt to ++ or -- non-int type " ++ show xt
+    when (xut /= TypeInt && xut /= TypeUint) $ typeError $ "Attempt to ++ or -- non-int type " ++ show xt
+    locCode <- lookupLocation i >>= compileLocation
+    return [opcode locCode (Lit 1)]
 
 
 -- turns a Location into the assembly string representing it
@@ -1289,9 +1287,10 @@ data Options = Options {
         ,optShowVersion :: Bool
         ,optShowHelp :: Bool
         ,optLibDirs :: [String]
+        ,optPackage :: Bool
     } deriving (Show)
 
-defaultOptions = Options "" False False []
+defaultOptions = Options "" False False [] False
 
 
 options :: [OptDescr (Options -> Options)]
@@ -1308,6 +1307,9 @@ options =
     , Option ['L'] ["libdir"]
         (ReqArg ((\d opts -> opts { optLibDirs = optLibDirs opts ++ [d] })) "DIR")
         "Add a directory to the library search path."
+    , Option ['p'] ["package"]
+        (NoArg (\opts -> opts { optPackage = True }))
+        "Include a CubeOS package header."
     ]
 
 compilerOpts :: [String] -> IO (Options, [String])
@@ -1337,16 +1339,21 @@ main = do
         _         -> return False
 
     when quit $ exitWith ExitSuccess
-    
+
     -- compile the main input file
     eParseTree <- loadFile inputFile
-    parseTree <- case eParseTree of
+    parseTree@(SourceFile pkgName _ _) <- case eParseTree of
         Left e  -> error $ "Could not load input file: " ++ inputFile
         Right p -> return p
 
     code <- doCompile parseTree (optLibDirs opts)
     let code' = optimize code
     outputHandle <- openFile (optOutput opts) WriteMode
+    when (optPackage opts) $ hPutStrLn outputHandle $ unlines [
+        ":package." ++ pkgName,
+        "DAT 0xffab, 0xcdff",
+        "DAT \"" ++ pkgName ++ "\", 0"
+        ]
     hPutStrLn outputHandle $ unlines $ map show code'
     hClose outputHandle
 
