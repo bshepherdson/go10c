@@ -630,7 +630,7 @@ convertible l r = do
     assign <- assignable l r
     uL <- underlyingType l
     uR <- underlyingType r
-    case (assign, uL == uR, l, r) of
+    case (assign, uL == uR, uL, uR) of
         (True, _, _, _) -> return True -- assignable
         (False, True, _, _) -> return True -- identical underlying types
         (_, _, TypePointer p1, TypePointer p2) -> convertible p1 p2
@@ -648,6 +648,9 @@ convertible l r = do
         (_, _, TypeName (QualIdent Nothing "int"), TypePointer _) -> return True
         (_, _, TypeInt, TypeArray _) -> return True
         (_, _, TypeName (QualIdent Nothing "int"), TypeArray _) -> return True
+        (_, _, TypeArray p1, TypePointer p2) -> convertible p1 p2
+        (_, _, TypePointer p1, TypeArray p2) -> convertible p1 p2
+        (_, _, TypeArray p1, TypeArray p2) -> convertible p1 p2
         _ -> return False
 
 -- returns True if a value of the first type can be assigned to a variable of the second type
@@ -777,7 +780,7 @@ compile (StmtAssignment Nothing lvalue rvalue) = do
     lt <- typeCheck lvalue
     rt <- typeCheck rvalue
     assign <- assignable rt lt
-    when (not assign) $ typeError $ "Right side of assignment is not assignable to left side.\n\tLeft: " ++ show lt ++ "\n\tRight: " ++ show rt
+    when (not assign) $ typeError $ "Right side of assignment is not assignable to left side.\n\tLeft: " ++ show lt ++ ", " ++ show lvalue ++ "\n\tRight: " ++ show rt ++ ", " ++ show rvalue
 
     -- if we get down here, then this assignment is legal, so compile it.
     r <- getReg
