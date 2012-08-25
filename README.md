@@ -34,7 +34,10 @@ go10c is a compiler from a dialect of Google Go to DCPU-16 assembly. It is writt
 * Newly allocated values, local and global values **are not** set to 0. Do not rely on them.
 * Global variables may not have initializers; they will be ignored.
 * Execution begins at `main()`. A file may be compiled that has no `main()`; in that case it is a library, and an attempt to execute the file will make the DCPU halt and catch fire.
-* Constants are unsupported for now.
+* Constants:
+    - Top-level constants only; no constants defined in functions are allowed.
+    - The type of the constants must be specified.
+    - Only simple constant values (integer literals, currently) are supported.
 * Struct changes:
     - Tags are not supported.
     - Anonymous fields are not supported.

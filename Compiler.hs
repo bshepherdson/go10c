@@ -65,6 +65,7 @@ data CompilerState = CS {
 data Location = LocReg String
               | LocStack Int -- places above the frame pointer, J
               | LocLabel String -- in the given label
+              | LocConstant Int
     deriving (Show)
 
 
@@ -175,6 +176,7 @@ doCompile (SourceFile thePackage imports statements_) libdirs = do
     allImports <- evalStateT (importsClosure imports (if null libdirs then ["."] else libdirs)) []
     let statements = allImports ++ fixSelectors statements_
     let allGlobals = findVariables statements
+        allConstants = findConstants statements
         allTypes = M.fromList $ findTypes statements ++ builtinTypes
         globalCode = flip concatMap allGlobals $ \(QualIdent mp i, t) -> [LabelDef (mkLabelInternal (fromMaybe thePackage mp) i)] ++ replicate (typeSizeInternal allTypes t) (DAT "0") -- include the label and enough space for the global
         -- a function called main becomes the start point.
@@ -193,7 +195,7 @@ doCompile (SourceFile thePackage imports statements_) libdirs = do
             types = allTypes,
             args = [],
             locals = [],
-            globals = map (\(g@(QualIdent mp i), _) -> (g, LocLabel (mkLabelInternal (fromMaybe thePackage mp) i))) allGlobals,
+            globals = map (\(g@(QualIdent mp i), _) -> (g, LocLabel (mkLabelInternal (fromMaybe thePackage mp) i))) allGlobals ++ allConstants,
             this = "",
             unique = 1,
             packageName = thePackage
@@ -240,6 +242,7 @@ exportedStatements :: String -> [Statement] -> [Statement]
 exportedStatements _ [] = []
 exportedStatements pkg (StmtTypeDecl (QualIdent Nothing i) t : rest) | isUpper (head i) = StmtTypeDecl (QualIdent (Just pkg) i) t : exportedStatements pkg rest
 exportedStatements pkg (StmtVarDecl (QualIdent Nothing i)  t x : rest) | isUpper (head i) = StmtVarDecl  (QualIdent (Just pkg) i) t x : exportedStatements pkg rest
+exportedStatements pkg (StmtConstDecl (QualIdent Nothing i)  mt x : rest) | isUpper (head i) = StmtConstDecl  (QualIdent (Just pkg) i) mt x : exportedStatements pkg rest
 exportedStatements pkg (StmtShortVarDecl (QualIdent Nothing i) x : rest) | isUpper (head i) = StmtShortVarDecl (QualIdent (Just pkg) i) x : exportedStatements pkg rest
 exportedStatements pkg (StmtFunction (QualIdent Nothing i) args ret _ : rest) | isUpper (head i) = StmtFunction (QualIdent (Just pkg) i) args ret Nothing : exportedStatements pkg rest
 exportedStatements pkg (_:rest) = exportedStatements pkg rest
@@ -303,6 +306,7 @@ findLocals (_:rest) = findLocals rest
 findSymbols :: [Statement] -> [(QualIdent, Type)]
 findSymbols [] = []
 findSymbols (StmtVarDecl s t _ : rest) = (s, t) : findSymbols rest
+findSymbols (StmtConstDecl s t _ : rest) = (s, t) : findSymbols rest
 findSymbols (StmtFunction name args ret _ : rest) = (name, TypeFunction (map snd args) ret) : findSymbols rest
 findSymbols (_:rest) = findSymbols rest
 
@@ -311,6 +315,15 @@ findVariables :: [Statement] -> [(QualIdent, Type)]
 findVariables [] = []
 findVariables (StmtVarDecl i@(QualIdent Nothing _) t _ : rest) = (i, t) : findVariables rest
 findVariables (_:rest) = findVariables rest
+
+-- finds constants with a shallow search. intended to find global constants in the whole file.
+findConstants :: [Statement] -> [(QualIdent, Location)]
+findConstants [] = []
+findConstants (StmtConstDecl i@(QualIdent Nothing _) _ (Just (LitInt x)) : rest) = (i, LocConstant x) : findConstants rest
+findConstants (StmtConstDecl i@(QualIdent Nothing _) _ (Just _) : rest) = compileError $ "Only integer literals are supported as contants."
+findConstants (StmtConstDecl _ _ Nothing : rest) = compileError $ "const declarations must include a value"
+findConstants (_:rest) = findConstants rest
+
 
 -- finds type declarations in a list of statements, intended for use on a whole file.
 findTypes :: [Statement] -> [(QualIdent, Type)]
@@ -680,6 +693,7 @@ compile (StmtTypeDecl name t) = return [] -- nothing to compile for typedecls.
 -- note that this doesn't add the symbol, but rather expects it to already exist. this does compile initializers, though.
 compile (StmtVarDecl name t Nothing) = addSymbol name t >> return [] -- nothing to do for a plain declaration
 compile (StmtVarDecl name t (Just x)) = addSymbol name t >> setVar name x
+compile (StmtConstDecl name t _) = addSymbol name t >> return [] -- nothing to do in code for constants.
 compile (StmtShortVarDecl name x) = do
     t <- typeCheck x
     addSymbol name t
@@ -900,6 +914,7 @@ compileLocation :: Location -> Compiler Arg
 compileLocation (LocReg r)   = return $ Reg r
 compileLocation (LocStack n) = return $ AddrRegLit "J" n -- can't use PICK or SP, unknown levels of saved values piled on top. Use J, the frame pointer.
 compileLocation (LocLabel s) = return $ AddrLabel s
+compileLocation (LocConstant i) = return $ Lit i
 
 
 -- compiles an expression, storing the result in the given register.
@@ -1056,6 +1071,7 @@ compileExpr (UnOp (LOp "&") x) r = do
             loc <- lookupLocation i
             case loc of
                 LocReg _ -> typeError $ "Attempt to take address of value contained in a register " ++ show i
+                LocConstant _ -> typeError $ "Attempt to take address of constant " ++ show i
                 LocStack n -> return [SET (Reg r) (Reg "J"), ADD (Reg r) (Lit n)]
         (Index x i) -> do
             xt <- typeCheck x
@@ -1207,6 +1223,7 @@ setVar i x = do
         LocReg s   -> return [SET (Reg s) (Reg r)]
         LocStack n -> return [SET (AddrRegLit "J" n) (Reg r)]
         LocLabel l -> return [SET (AddrLabel l) (Reg r)]
+        LocConstant _ -> typeError $ "Attempt to assign a value to constant " ++ show i
 
     freeReg r
     return $ exprCode ++ storeCode

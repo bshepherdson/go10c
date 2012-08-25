@@ -192,6 +192,7 @@ NonPointerType : TypeName       { $1 }
 
 Declaration :: { [Statement] }
 Declaration : TypeDecl { $1 }
+            | ConstDecl { $1 }
             | VarDecl   { $1 }
             | ShortVarDecl { $1 }
 
@@ -215,6 +216,19 @@ TypeSpecs : TypeSpecs eol TypeSpec  { $3 ++ $1 }
           {- no empty -}
 TypeSpec :: { [Statement] }
 TypeSpec : ident Type               { [StmtTypeDecl (QualIdent Nothing $1) $2] }
+
+
+ConstDecl :: { [Statement] }
+ConstDecl : const ConstSpec         { $2 }
+          | const OP ConstSpecs CP  { $3 }
+
+ConstSpecs :: { [Statement] }
+ConstSpecs : ConstSpecs eol ConstSpec { $3 ++ $1 }
+           | ConstSpecs eol           { $1 }
+           | ConstSpec                { $1 }
+
+ConstSpec :: { [Statement] }
+ConstSpec : IdentifierList Type '=' ExpressionList      { zipWith (\i x -> StmtConstDecl (QualIdent Nothing i) $2 x) $1 (map Just $4 ++ repeat Nothing) }
 
 
 VarDecl :: { [Statement] }
@@ -567,6 +581,7 @@ instance Eq Type where
 
 data Statement = StmtTypeDecl QualIdent Type
                | StmtVarDecl QualIdent Type (Maybe Expr)
+               | StmtConstDecl QualIdent Type (Maybe Expr)
                | StmtShortVarDecl QualIdent Expr
                | StmtFunction QualIdent [(String, Type)] Type (Maybe [Statement])
                | StmtLabel String

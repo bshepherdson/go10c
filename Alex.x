@@ -39,9 +39,9 @@ $blank+ ; -- ignore non-newline whitespace
 \' ($graphical # [\'\\] | \\\' | @escape) \'  { LChar . head . tail . escape charEscapes } -- first character inside the quotes
 
 -- integer literals
-0 $octdigit+                { mkInt readOct }
+0 $octdigit+                { mkInt readOct . tail }
+0x $hexdigit+               { mkInt readHex . drop 2 }
 $digit+                     { mkInt reads   }
-0x $hexdigit+               { mkInt readHex }
 
 -- boolean literals
 true    { const $ LBool True }
@@ -157,7 +157,7 @@ data Token = LNewline
 mkInt :: ReadS Int -> String -> Token
 mkInt f s = case f s of
     [(x,"")] -> LInt x
-    _        -> error "Broken integer literal"
+    _        -> error $ "Broken integer literal: '" ++ s ++ "'"
 
 keyword = const
 
