@@ -107,8 +107,10 @@ data Asm = SET Arg Arg
          | HCF -- arg is unused, compiles a literal 0.
          | LabelDef String
          | DAT String -- DAT statement with the literal asm following
+         | Comment Asm String -- statement with a comment attached. Useful for annotating output for debugging.
 
-data Arg = Reg String -- used only for main registers A-J
+data Arg = Reg String -- used only for main registers A-J. May be clobbered.
+         | RegP String -- used for main registers, DO NOT CLOBBER. Usually used for arguments.
          | PUSH
          | POP
          | PEEK
@@ -122,6 +124,8 @@ data Arg = Reg String -- used only for main registers A-J
          | AddrLabel String
          | Label String
     deriving (Eq)
+
+data ExprResult = XR [Asm] Arg
 
 instance Show Asm where
     show (JSR a) = "JSR " ++ show a
@@ -151,9 +155,11 @@ instance Show Asm where
     show (IFA b a) = "IFA " ++ show b ++ ", " ++ show a
     show (IFL b a) = "IFL " ++ show b ++ ", " ++ show a
     show (IFU b a) = "IFU " ++ show b ++ ", " ++ show a
+    show (Comment a c) = show a ++ " ; " ++ c
 
 instance Show Arg where
     show (Reg s) = s
+    show (RegP s) = s
     show PUSH = "PUSH"
     show POP = "POP"
     show PEEK = "PEEK"
@@ -388,6 +394,11 @@ getReg = do
 freeReg :: String -> Compiler ()
 freeReg r = modify $ \s -> s { freeRegs = r : freeRegs s }
 
+-- frees an argument for a sub-value, if it was returned in a register.
+freeIfReg :: Arg -> Compiler ()
+freeIfReg (Reg r) = freeReg r
+freeIfReg _ = return ()
+
 
 -- turns a function name into a compiler label
 mkLabel :: QualIdent -> Compiler String
@@ -468,7 +479,7 @@ typeCheck (Call f args) = do
 typeCheck (BuiltinCall LNew (Just (TypeArray t)) [n]) = do
     nt <- typeCheck n
     nut <- underlyingType nt
-    when (nut /= TypeInt) $ typeError $ "new() called to create an array type with non-int size of type " ++ show nt
+    when (nut /= TypeInt && nut /= TypeUint) $ typeError $ "new() called to create an array type with non-int size of type " ++ show nt
     return (TypeArray t) -- arrays are already pointers, we don't need to create a pointer to them.
 
 typeCheck (BuiltinCall LNew (Just (TypeArray t)) _) = typeError $ "new() called to create an array but no size was provided"
@@ -761,14 +772,12 @@ compile (StmtFunction name args ret (Just body)) = do
 compile (StmtLabel s) = return [LabelDef s] -- this isn't easy to do re: labeled jumps and breaks and crap. maybe make this a container instead of an ordinary statement.
 
 compile (StmtExpr x@(Call _ _)) = do
-    r <- getReg
-    code <- compileExpr x r
-    freeReg r
+    XR code arg <- compileExpr x
+    freeIfReg arg
     return code
 compile (StmtExpr x@(BuiltinCall _ _ _)) = do
-    r <- getReg
-    code <- compileExpr x r
-    freeReg r
+    XR code arg <- compileExpr x
+    freeIfReg arg
     return code
 compile (StmtExpr x) = error $ "Suspicious code. Expression " ++ show x ++ " has no side effects."
 
@@ -783,23 +792,46 @@ compile (StmtAssignment Nothing lvalue rvalue) = do
     when (not assign) $ typeError $ "Right side of assignment is not assignable to left side.\n\tLeft: " ++ show lt ++ ", " ++ show lvalue ++ "\n\tRight: " ++ show rt ++ ", " ++ show rvalue
 
     -- if we get down here, then this assignment is legal, so compile it.
-    r <- getReg
-    exprCode <- compileExpr rvalue r
-    code <- case lvalue of
+    XR exprCode exprVal <- compileExpr rvalue
+    case lvalue of
         (Var i) -> do
             locCode <- lookupLocation i >>= compileLocation
-            return $ exprCode ++ [SET locCode (Reg r)]
+            freeIfReg exprVal
+            return $ exprCode ++ [SET locCode exprVal]
 
         (Index x i) -> do
-            rx <- getReg
-            xCode <- compileExpr x rx
-            ri <- getReg
-            iCode <- compileExpr i ri
-            freeReg rx
-            freeReg ri
+            XR xCode xVal <- compileExpr x
+            XR iCode iVal <- compileExpr i
             (TypeArray elementType) <- underlyingType =<< typeCheck x
             size <- typeSize elementType
-            return $ exprCode ++ xCode ++ iCode ++ [MUL (Reg ri) (Lit size), ADD (Reg rx) (Reg ri), SET (AddrReg rx) (Reg r)]
+
+            case (size, xVal, iVal) of
+                (_, Lit nx, Lit ni) -> do
+                    freeIfReg exprVal
+                    return $ exprCode ++ [SET (AddrLit (nx + size*ni)) exprVal]
+                (_, Reg ar, Lit n)  -> do
+                    freeReg ar
+                    freeIfReg exprVal
+                    return $ xCode ++ [ADD (Reg ar) (Lit (size*n)), SET (AddrReg ar) exprVal]
+                (_, _, Reg ir) -> do
+                    freeIfReg xVal
+                    freeIfReg exprVal
+                    freeReg ir
+                    return $ exprCode ++ xCode ++ iCode ++
+                            (if size > 1 then [MUL (Reg ir) (Lit size)] else []) ++
+                            [ADD (Reg ir) xVal, SET (AddrReg ir) exprVal]
+                (1, Reg ar, _) -> do
+                    freeReg ar
+                    freeIfReg exprVal
+                    return $ exprCode ++ xCode ++ iCode ++ [ADD (Reg ar) iVal, SET (AddrReg ar) exprVal]
+                (_, _, _) -> do
+                    r <- getReg
+                    freeIfReg xVal
+                    freeIfReg exprVal
+                    return $ exprCode ++ xCode ++ iCode ++ [SET (Reg r) iVal] ++
+                            (if size > 1 then [MUL (Reg r) (Lit size)] else []) ++
+                            [ADD (Reg r) xVal, SET (AddrReg r) exprVal]
+
 
         (Selector x s) -> do
             t <- typeCheck x
@@ -810,14 +842,21 @@ compile (StmtAssignment Nothing lvalue rvalue) = do
                 _ -> typeError $ "Attempt to select a field from a non-struct value of type " ++ show t
             offset <- fieldOffset fields s
 
-            rx <- getReg
-            xCode <- compileExpr x rx
-            freeReg rx
-            return $ exprCode ++ xCode ++ [ADD (Reg rx) (Lit offset), SET (AddrReg rx) (Reg r)]
+            XR xCode xVal <- compileExpr x
+            freeIfReg exprVal
+
+            case xVal of
+                Lit n -> return $ exprCode ++ xCode ++ [SET (AddrLit (n+offset)) exprVal]
+                Reg r -> do
+                    freeReg r
+                    return $ exprCode ++ xCode ++ [SET (AddrRegLit r offset) exprVal]
+                _ -> do
+                    r <- getReg
+                    freeReg r
+                    return $ exprCode ++ xCode ++
+                        [SET (Reg r) xVal, ADD (Reg r) (Lit offset), SET (AddrReg r) exprVal]
 
         _ -> error "Not implemented: Assigning to lvalues other than variables, array elements or struct fields."
-    freeReg r
-    return code
 
 -- TODO: Optimization: some ops, like += and -=, can be optimized by using ADD instead of computing and setting. Priority low, though, only a couple of instructions wasted.
 compile (StmtAssignment (Just op) lvalue rvalue) = compile (StmtAssignment Nothing lvalue (BinOp (LOp op) lvalue rvalue))
@@ -836,14 +875,13 @@ compile (StmtIf initializer condition ifbody elsebody) = do
     ct <- typeCheck condition
     when (ct /= TypeBool) $ typeError $ "Condition of an if statement must have type bool, found " ++ show ct
 
-    r <- getReg
-    condCode <- compileExpr condition r
+    XR condCode condVal <- compileExpr condition
+    freeIfReg condVal
 
     -- get a label prefix for this if, set 'this' appropriately.
     prefix <- uniqueLabel
-    let jumpCode = [IFE (Reg r) (Lit 0),
+    let jumpCode = [IFE condVal (Lit 0),
                     SET PC (Label $ if null elsebody then prefix ++ "_endif" else prefix ++ "_else")] -- jump if the condition is false, since we're jumping to the else block.
-    freeReg r -- don't need this reserved anymore, because the jump is now compiled.
     ifCode <- concat <$> mapM compile ifbody
     let ifJumpCode = if null elsebody then [] else [SET PC (Label (prefix ++ "_endif"))] -- add a jump to the end of the if body if there's an else to jump over.
 
@@ -876,10 +914,9 @@ compile (StmtFor initializer condition incrementer body) = do
     when (ct /= TypeBool) $ typeError $ "Loop condition must have type bool, found " ++ show ct
 
 
-    r <- getReg
-    condCode <- compileExpr condition r
-    let condCheckCode = [IFE (Reg r) (Lit 0), SET PC (Label (prefix ++ "_end"))]
-    freeReg r
+    XR condCode condVal <- compileExpr condition
+    let condCheckCode = [IFE condVal (Lit 0), SET PC (Label (prefix ++ "_end"))]
+    freeIfReg condVal
 
     bodyCode <- concat <$> mapM compile body
     incCode <- concat <$> mapM compile incrementer
@@ -897,10 +934,9 @@ compile (StmtReturn mx) = do
     exprCode <- case mx of
         Nothing -> return []
         Just x  -> do
-            r <- getReg
-            code <- compileExpr x r
-            freeReg r
-            return $ code ++ [SET (Reg "A") (Reg r)]
+            XR code arg <- compileExpr x
+            freeIfReg arg
+            return $ code ++ [SET (Reg "A") arg]
     t <- gets this
     return $ exprCode ++ [SET PC (Label (t ++ "_done"))]
 
@@ -921,161 +957,244 @@ compileIncDec opcode (Var i) = do
 
 -- turns a Location into the assembly string representing it
 compileLocation :: Location -> Compiler Arg
-compileLocation (LocReg r)   = return $ Reg r
+compileLocation (LocReg r)   = return $ RegP r -- use RegP to prevent compileExpr from overwriting this value.
 compileLocation (LocStack n) = return $ AddrRegLit "J" n -- can't use PICK or SP, unknown levels of saved values piled on top. Use J, the frame pointer.
 compileLocation (LocLabel s) = return $ AddrLabel s
 compileLocation (LocConstant i) = return $ Lit i
 
 
 -- compiles an expression, storing the result in the given register.
-compileExpr :: Expr -> String -> Compiler [Asm]
-compileExpr (LitInt n) r = return [SET (Reg r) (Lit n)]
-compileExpr (LitBool b) r = return [SET (Reg r) (Lit (if b then 1 else 0))]
-compileExpr (LitChar c) r = return [SET (Reg r) (Lit (ord c))]
-compileExpr (LitString s) r = do
+compileExpr :: Expr -> Compiler ExprResult
+compileExpr (LitInt n) = return $ XR [] (Lit n)
+compileExpr (LitBool b) = return $ XR [] (Lit (if b then 1 else 0))
+compileExpr (LitChar c) = return $ XR [] (Lit (ord c))
+compileExpr (LitString s) = do
     unique <- uniqueLabel
     modify $ \st -> st { strings = (unique, s) : strings st }
-    return [SET (Reg r) (Label unique)]
+    return $ XR [] (Label unique)
 
-compileExpr (LitComposite _ _) _ = error "Composite literals not implemented"
+compileExpr (LitComposite _ _) = compileError "Composite literals not implemented"
 
-compileExpr (Var (QualIdent Nothing "nil")) r = return [SET (Reg r) (Lit 0)]
+compileExpr (Var (QualIdent Nothing "nil")) = return $ XR [] (Lit 0)
 
-compileExpr (Var i) r = do
-    loc <- lookupLocation i >>= compileLocation
-    return [SET (Reg r) loc]
+compileExpr (Var i) = XR [] <$> (compileLocation =<< lookupLocation i)
 
-compileExpr (Selector x s) r = do
+compileExpr (Selector x s) = do
     t <- typeCheck x
     ut <- underlyingType t
     fields <- case ut of
         (TypeStruct fields) -> return fields
         (TypePointer (TypeStruct fields)) -> return fields
         _ -> typeError $ "Attempt to select field '" ++ s ++ "' from non-struct type " ++ show t
-    xCode <- compileExpr x r
     offset <- fieldOffset fields s
-    return $ xCode ++ [ADD (Reg r) (Lit offset), SET (Reg r) (AddrReg r)]
+    XR xCode xVal <- compileExpr x
+    case xVal of
+        Reg r -> return $ XR (xCode ++ [SET (Reg r) (AddrRegLit r offset)]) (Reg r)
+        _ -> do
+            r <- getReg
+            return $ XR (xCode ++ [SET (Reg r) xVal, SET (Reg r) (AddrRegLit r offset)]) (Reg r)
 
 
-compileExpr (Index arr ix) r = do
+compileExpr (Index arr ix) = do
     arrType <- typeCheck arr
     size <- typeSize arrType
-    arrCode <- compileExpr arr r
-    ixR <- getReg
-    ixCode <- compileExpr ix ixR
-    freeReg ixR
-    let ret = arrCode ++ ixCode ++
-             (if size > 1 then [MUL (Reg ixR) (Lit size)] else []) ++ -- if the size of the array elements is > 1, multiply from the index to the offset. TODO optimization trivial: shift for sizes that are powers of 2.
-             [ADD (Reg r) (Reg ixR), SET (Reg r) (AddrReg r)]
-    return ret
+    XR arrCode arrVal <- compileExpr arr
+    XR ixCode ixVal <- compileExpr ix
 
-compileExpr (Call f args) r = do
+    r <- getReg
+
+    case (size, arrVal, ixVal) of
+        (_, Reg ar, Lit n) -> return $ XR (arrCode ++ [SET (Reg ar) (AddrRegLit ar (size*n))]) (Reg ar)
+        (_, Reg ar, Reg ir) -> do
+            freeReg ir
+            return $ XR (arrCode ++ ixCode ++ [
+                    MUL (Reg ir) (Lit size),
+                    ADD (Reg ar) (Reg ir),
+                    SET (Reg ar) (AddrReg ar)])
+                (Reg ar)
+        (1, Reg ar, _) -> return $ XR (arrCode ++ ixCode ++ [
+                    ADD (Reg ar) ixVal,
+                    SET (Reg ar) (AddrReg ar)])
+                (Reg ar)
+        (1, _, _) -> do
+            r <- getReg
+            freeIfReg arrVal
+            return $ XR (arrCode ++ ixCode ++ [
+                    SET (Reg r) ixVal,
+                    MUL (Reg r) (Lit size),
+                    ADD (Reg r) arrVal,
+                    SET (Reg r) (AddrReg r)])
+                (Reg r)
+        (_, _, Lit n) -> do
+            r <- getReg
+            return $ XR (arrCode ++ [
+                    SET (Reg r) arrVal,
+                    SET (Reg r) (AddrRegLit r (size*n))])
+                (Reg r)
+        (_, _, Reg ir) -> return $ XR (arrCode ++ ixCode ++ [
+                    MUL (Reg ir) (Lit size),
+                    ADD (Reg ir) arrVal,
+                    SET (Reg ir) (AddrReg ir)])
+                (Reg ir)
+        (_, _, _) -> do
+            iR <- getReg
+            freeReg iR
+            freeIfReg arrVal
+            return $ XR (arrCode ++ ixCode ++ [
+                    SET (Reg iR) ixVal,
+                    MUL (Reg iR) (Lit size),
+                    ADD (Reg iR) arrVal,
+                    SET (Reg iR) (AddrReg iR)])
+                (Reg iR)
+
+
+compileExpr (Call f args) = do
     when (length args >= 4) $ error "Functions with more than 3 arguments are not implemented."
 
     -- I don't need the type, but I do need to typecheck.
     t <- typeCheck (Call f args)
     tf <- typeCheck f
 
-    (saveCode, restoreCode) <- saveRegsForCall r
-    ra <- getReg
-    argCode <- concatMap (++ [SET PUSH (Reg ra)]) <$> sequence (map (flip compileExpr ra) args)
+    retArg <- case tf of
+        TypeFunction _ TypeVoid -> return $ Lit 0
+        TypePointer (TypeFunction _ TypeVoid) -> return $ Lit 0
+        TypeFunction _ r -> Reg <$> getReg
+        TypePointer (TypeFunction _ r) -> Reg <$> getReg
+        _ -> typeError $ "Attempt to call non-function value of type: " ++ show tf
+
+
+    -- If the return argument is not a register, ie. this is a void function, just send a fake "_" register so it'll save everything.
+    (saveCode, restoreCode) <- saveRegsForCall (case retArg of Reg r -> r; _ -> "_")
+    argCode <- concat <$> forM args (\arg -> do
+            XR code val <- compileExpr arg
+            freeIfReg val
+            return $ code ++ [SET PUSH val])
     let popArgsCode = reverse $ zipWith (\r _ -> SET (Reg r) POP) ["A", "B", "C"] args
-    freeReg ra
+
     jsrCode <- case (tf,f) of
         (TypeFunction _ _, Var name) -> do
             label <- mkLabel name
             return [JSR (Label label)]
         (TypePointer (TypeFunction _ _), x) -> do
-            pr <- getReg
-            ptrCode <- compileExpr x pr
-            freeReg pr
-            return $ ptrCode ++ [JSR (Reg pr)]
+            XR ptrCode ptrVal <- compileExpr x
+            freeIfReg ptrVal
+            return $ ptrCode ++ [JSR ptrVal]
         (t_, f_) -> error $ "Bad case: t = " ++ show t_ ++ ", f = " ++ show f_
 
-    let returnCode = [SET (Reg r) (Reg "A")]
+    let returnCode = case retArg of
+                         Reg r -> [SET (Reg r) (Reg "A")]
+                         _     -> [] -- void, no return value to shuffle around.
 
-    return $ saveCode ++ argCode ++ popArgsCode ++ jsrCode ++ returnCode ++ restoreCode
+    return $ XR (saveCode ++ argCode ++ popArgsCode ++ jsrCode ++ returnCode ++ restoreCode) retArg
 
 -- creating an array with a length
-compileExpr (BuiltinCall LNew (Just (TypeArray t)) (n:_)) r = do
+compileExpr (BuiltinCall LNew (Just (TypeArray t)) (n:_)) = do
+    r <- getReg
     (saveCode, restoreCode) <- saveRegsForCall r
     size <- typeSize t
-    lengthCode <- compileExpr n r
-    return $ saveCode ++ lengthCode ++
-             [SET (Reg "A") (Lit size),
-              MUL (Reg "A") (Reg r),          -- size in words
-              JSR (AddrLit 9)] ++    -- pointer is stored in A
+    XR lenCode lenVal <- compileExpr n
+    freeIfReg lenVal
+    let argCode = case lenVal of
+                      Lit n -> [SET (Reg "A") (Lit (size*n))]
+                      _     -> [SET (Reg "A") lenVal, MUL (Reg "A") (Lit size)]
+    return $ XR (saveCode ++ lenCode ++ argCode ++ [JSR (AddrLit 9)] ++
              (if r /= "A" then [SET (Reg r) (Reg "A")] else []) ++
-             restoreCode
+             restoreCode) (Reg r)
 
-compileExpr (BuiltinCall LNew (Just t) _) r = do
+compileExpr (BuiltinCall LNew (Just t) _) = do
     ut <- underlyingType t
+    r <- getReg
     (saveCode, restoreCode) <- saveRegsForCall r
     size <- typeSize ut
-    return $ saveCode ++
+    return $ XR (saveCode ++
              [SET (Reg "A") (Lit size),
               JSR (AddrLit 9)] ++ -- pointer is stored in A
              (if r /= "A" then [SET (Reg r) (Reg "A")] else []) ++
-             restoreCode
+             restoreCode) (Reg r)
 
-compileExpr (BuiltinCall LNew Nothing [Var t]) r = do
+compileExpr (BuiltinCall LNew Nothing [Var t]) = do
     ut <- underlyingType (TypeName t)
+    r <- getReg
     (saveCode, restoreCode) <- saveRegsForCall r
     size <- typeSize ut
-    return $ saveCode ++
+    return $ XR (saveCode ++
              [SET (Reg "A") (Lit size),
               JSR (AddrLit 9)] ++ -- pointer is stored in A
              (if r /= "A" then [SET (Reg r) (Reg "A")] else []) ++
-             restoreCode
+             restoreCode) (Reg r)
 
-compileExpr (BuiltinCall LNew _ _) _ = compileError "new() called with no type as an argument"
+compileExpr (BuiltinCall LNew _ _) = compileError "new() called with no type as an argument"
 
-compileExpr (BuiltinCall LDelete Nothing [x]) _ = do
+compileExpr (BuiltinCall LDelete Nothing [x]) = do
     (saveCode, restoreCode) <- saveRegsForCall "_" -- placeholder
     -- the type has already been checked, so just call it.
-    expCode <- compileExpr x "A"
-    return $ saveCode ++ expCode ++ [JSR (AddrLit 10)] ++ restoreCode
+    XR expCode expVal <- compileExpr x
+    freeIfReg expVal
+    return $ XR (saveCode ++ expCode ++ [SET (Reg "A") expVal, JSR (AddrLit 10)] ++ restoreCode) (Lit 0)
 
-compileExpr (BuiltinCall LDelete _ _) _ = typeError "delete() must be called with exactly one pointer."
+compileExpr (BuiltinCall LDelete _ _) = typeError "delete() must be called with exactly one pointer."
 
-compileExpr (BuiltinCall LPanic _ _) _ = return [HCF]
+compileExpr (BuiltinCall LPanic _ _) = return $ XR [HCF] (Lit 0)
 
 
-compileExpr (Conversion t x) r = do
+compileExpr (Conversion t x) = do
     xt <- typeCheck x
     canConvert <- convertible xt t
     when (not canConvert) $ typeError $ "Cannot convert from " ++ show xt ++ " to " ++ show t
     -- convertible types don't require any actual changes, there's no change to perform.
-    compileExpr x r
+    compileExpr x
 
 
-compileExpr (UnOp (LOp "+") x) r = compileExpr x r -- nothing to do for +
-compileExpr (UnOp (LOp "-") x) r = do
+compileExpr (UnOp (LOp "+") x) = compileExpr x -- nothing to do for +
+
+compileExpr (UnOp (LOp "-") (LitInt n)) = return $ XR [] (Lit (-n))
+compileExpr (UnOp (LOp "-") x) = do
     ut <- typeCheck x >>= underlyingType
     when (ut /= TypeInt && ut /= TypeUint) $ typeError $ "Cannot negate non-(u)int value of type " ++ show ut
-    exprCode <- compileExpr x r
-    return $ exprCode ++ [XOR (Reg r) (Lit 0xffff), ADD (Reg r) (Lit 1)] -- 2s complement negation.
+    XR exprCode exprVal <- compileExpr x
+    case exprVal of
+        Lit n -> return $ XR [] (Lit (-n))
+        Reg r -> return $ XR (exprCode ++ [XOR (Reg r) (Lit 0xffff), ADD (Reg r) (Lit 1)]) (Reg r)
+        _     -> do
+            r <- getReg
+            return $ XR (exprCode ++ [SET (Reg r) exprVal, XOR (Reg r) (Lit 0xffff), ADD (Reg r) (Lit 1)]) (Reg r)
 
-compileExpr (UnOp (LOp "!") x) r = do
+compileExpr (UnOp (LOp "!") x) = do
     ut <- typeCheck x >>= underlyingType
     when (ut /= TypeBool) $ typeError $ "Unary ! can only be applied to bool values."
-    exprCode <- compileExpr x r
-    return $ exprCode ++ [XOR (Reg r) (Lit 1)] -- MUST have booleans as 0 and 1, not 0 and nonzero or 0 and 0xffff
+    XR exprCode exprVal <- compileExpr x
+    case exprVal of
+        (Lit 0) -> return $ XR [] (Lit 1)
+        (Lit 1) -> return $ XR [] (Lit 0)
+        (Lit n) -> compileError $ "Can't happen: Boolean literal with value " ++ show n
+        (Reg r) -> return $ XR (exprCode ++ [XOR (Reg r) (Lit 1)]) (Reg r)
+        _ -> do
+            r <- getReg
+            return $ XR (exprCode ++ [SET (Reg r) exprVal, XOR (Reg r) (Lit 1)]) (Reg r)
 
-compileExpr (UnOp (LOp "^") x) r = do
+compileExpr (UnOp (LOp "^") x) = do
     ut <- typeCheck x >>= underlyingType
     when (ut /= TypeInt && ut /= TypeUint) $ typeError $ "Unary ^ can only be applied to int and uint values."
-    exprCode <- compileExpr x r
-    return $ exprCode ++ [XOR (Reg r) (Lit 0xffff)]
+    XR exprCode exprVal <- compileExpr x
+    case exprVal of
+        Reg r -> return $ XR (exprCode ++ [XOR (Reg r) (Lit 0xffff)]) (Reg r)
+        _ -> do
+            r <- getReg
+            return $ XR (exprCode ++ [SET (Reg r) exprVal, XOR (Reg r) (Lit 0xffff)]) (Reg r)
 
-compileExpr (UnOp (LOp "*") x) r = do
+compileExpr (UnOp (LOp "*") x) = do
     t <- typeCheck x
     ut <- underlyingType t
     when (not (isPointer ut)) $ typeError $ "Attempt to dereference non-pointer type " ++ show t
-    exprCode <- compileExpr x r
-    return $ exprCode ++ [SET (Reg r) (AddrReg r)]
+    XR exprCode exprVal <- compileExpr x
+    case exprVal of
+        Lit n -> return $ XR [] (AddrLit n)
+        Reg r -> return $ XR (exprCode ++ [SET (Reg r) (AddrReg r)]) (Reg r)
+        _ -> do
+            r <- getReg
+            return $ XR (exprCode ++ [SET (Reg r) exprVal, SET (Reg r) (AddrReg r)]) (Reg r)
 
-compileExpr (UnOp (LOp "&") x) r = do
+compileExpr (UnOp (LOp "&") x) = do
     when (not (isLvalue x)) $ typeError $ "Cannot take address of non-variable expression."
     case x of
         (Var i) -> do
@@ -1083,7 +1202,7 @@ compileExpr (UnOp (LOp "&") x) r = do
             case loc of
                 LocReg _ -> typeError $ "Attempt to take address of value contained in a register " ++ show i
                 LocConstant _ -> typeError $ "Attempt to take address of constant " ++ show i
-                LocStack n -> return [SET (Reg r) (Reg "J"), ADD (Reg r) (Lit n)]
+                LocStack n -> return $ XR [] (AddrRegLit "J" n)
         (Index x i) -> do
             xt <- typeCheck x
             xut <- underlyingType xt
@@ -1095,13 +1214,26 @@ compileExpr (UnOp (LOp "&") x) r = do
 
             size <- typeSize elementType
 
-            xCode <- compileExpr x r
-            ir <- getReg
-            iCode <- compileExpr i ir
-            freeReg ir
-            return $ xCode ++ iCode ++
-                     (if size > 1 then [MUL (Reg ir) (Lit size)] else []) ++
-                     [ADD (Reg r) (Reg ir)]
+            XR xCode xVal <- compileExpr x
+            XR iCode iVal <- compileExpr i
+            case (size, xVal, iVal) of
+                (_, Lit nx, Lit ni) -> return $ XR [] (Lit (nx + size*ni))
+                (_, Reg ar, Lit n)  -> return $ XR (xCode ++ [ADD (Reg ar) (Lit (size*n))]) (Reg ar)
+                (_, _, Reg ir) -> do
+                    freeIfReg xVal
+                    return $ XR (xCode ++ iCode ++
+                            (if size > 1 then [MUL (Reg ir) (Lit size)] else []) ++
+                            [ADD (Reg ir) xVal])
+                        (Reg ir)
+                (1, Reg ar, _) -> return $ XR (xCode ++ iCode ++ [ADD (Reg ar) iVal]) (Reg ar)
+                (_, _, _) -> do
+                    r <- getReg
+                    freeIfReg xVal
+                    return $ XR (xCode ++ iCode ++ [SET (Reg r) iVal] ++
+                            (if size > 1 then [MUL (Reg r) (Lit size)] else []) ++
+                            [ADD (Reg r) xVal])
+                        (Reg r)
+
         (Selector x s) -> do
             t <- typeCheck x
             ut <- underlyingType t
@@ -1109,40 +1241,45 @@ compileExpr (UnOp (LOp "&") x) r = do
                 (TypeStruct fields) -> return fields
                 _ -> typeError $ "Attempt to access fields of non-struct value. Actual type is " ++ show t
             offset <- fieldOffset fields s
-            xCode <- compileExpr x r
-            return $ xCode ++ [ADD (Reg r) (Lit offset)]
+            XR xCode xVal <- compileExpr x
+            case xVal of
+                Lit n -> return $ XR [] (Lit (n+offset))
+                Reg r -> return $ XR (xCode ++ [ADD (Reg r) (Lit offset)]) (Reg r)
+                _ -> do
+                    r <- getReg
+                    return $ XR (xCode ++ [SET (Reg r) xVal, ADD (Reg r) (Lit offset)]) (Reg r)
 
         x -> typeError "Cannot take the address of this value."
 
 
-compileExpr (BinOp (LOp "+") left right) r = compileIntegralBinOp ADD ADD "+" left right r
-compileExpr (BinOp (LOp "-") left right) r = compileIntegralBinOp SUB SUB "-" left right r
-compileExpr (BinOp (LOp "*") left right) r = compileIntegralBinOp MUL MLI "*" left right r
-compileExpr (BinOp (LOp "/") left right) r = compileIntegralBinOp DIV DVI "/" left right r
-compileExpr (BinOp (LOp "%") left right) r = compileIntegralBinOp MOD MDI "%" left right r
-compileExpr (BinOp (LOp "|") left right) r = compileIntegralBinOp BOR BOR "|" left right r
-compileExpr (BinOp (LOp "^") left right) r = compileIntegralBinOp XOR XOR "^" left right r
-compileExpr (BinOp (LOp "&") left right) r = compileIntegralBinOp AND AND "&" left right r
-compileExpr (BinOp (LOp "<<") left right) r = compileIntegralBinOp SHL SHL "<<" left right r
-compileExpr (BinOp (LOp ">>") left right) r = compileIntegralBinOp SHR ASR ">>" left right r
+compileExpr (BinOp (LOp "+") left right) = compileIntegralBinOp ADD ADD "+" True  left right
+compileExpr (BinOp (LOp "-") left right) = compileIntegralBinOp SUB SUB "-" False left right
+compileExpr (BinOp (LOp "*") left right) = compileIntegralBinOp MUL MLI "*" True  left right
+compileExpr (BinOp (LOp "/") left right) = compileIntegralBinOp DIV DVI "/" False left right
+compileExpr (BinOp (LOp "%") left right) = compileIntegralBinOp MOD MDI "%" False left right
+compileExpr (BinOp (LOp "|") left right) = compileIntegralBinOp BOR BOR "|" True  left right
+compileExpr (BinOp (LOp "^") left right) = compileIntegralBinOp XOR XOR "^" True  left right
+compileExpr (BinOp (LOp "&") left right) = compileIntegralBinOp AND AND "&" True  left right
+compileExpr (BinOp (LOp "<<") left right) = compileIntegralBinOp SHL SHL "<<" False left right
+compileExpr (BinOp (LOp ">>") left right) = compileIntegralBinOp SHR ASR ">>" False left right
 
-compileExpr (BinOp (LOp "==") left right) r = compileEqBinOp IFE "==" left right r
-compileExpr (BinOp (LOp "!=") left right) r = compileEqBinOp IFN "!=" left right r
+compileExpr (BinOp (LOp "==") left right) = compileEqBinOp IFE "==" left right
+compileExpr (BinOp (LOp "!=") left right) = compileEqBinOp IFN "!=" left right
 
-compileExpr (BinOp (LOp "||") left right) r = compileLogicalBinOp BOR "||" left right r
-compileExpr (BinOp (LOp "&&") left right) r = compileLogicalBinOp AND "&&" left right r
+compileExpr (BinOp (LOp "||") left right) = compileLogicalBinOp "||" left right
+compileExpr (BinOp (LOp "&&") left right) = compileLogicalBinOp "&&" left right
 
-compileExpr (BinOp (LOp ">") left right) r = compileComparisonOp IFG IFA ">" id left right r
-compileExpr (BinOp (LOp "<") left right) r = compileComparisonOp IFL IFU "<" id left right r
-compileExpr (BinOp (LOp ">=") left right) r = compileComparisonOp IFL IFU ">=" swap left right r -- >= is < with the arguments swapped
-compileExpr (BinOp (LOp "<=") left right) r = compileComparisonOp IFG IFA "<=" swap left right r -- <= is > with the arguments swapped
+compileExpr (BinOp (LOp ">") left right) = compileComparisonOp IFG IFA ">" id left right
+compileExpr (BinOp (LOp "<") left right) = compileComparisonOp IFL IFU "<" id left right
+compileExpr (BinOp (LOp ">=") left right) = compileComparisonOp IFL IFU ">=" swap left right -- >= is < with the arguments swapped
+compileExpr (BinOp (LOp "<=") left right) = compileComparisonOp IFG IFA "<=" swap left right -- <= is > with the arguments swapped
 
-compileExpr x r = compileError $ "Unknown expression: " ++ show x
+compileExpr x = compileError $ "Unknown expression: " ++ show x
 
 
 -- helper function for integral type binary operations like +, -, | and <<
-compileIntegralBinOp :: Opcode -> Opcode -> String -> Expr -> Expr -> String -> Compiler [Asm]
-compileIntegralBinOp unsignedOp signedOp opName left right r = do
+compileIntegralBinOp :: Opcode -> Opcode -> String -> Bool -> Expr -> Expr -> Compiler ExprResult
+compileIntegralBinOp unsignedOp signedOp opName commutes left right = do
     [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
     op <- case (leftType, rightType) of
         (TypeInt, TypeInt) -> return signedOp
@@ -1152,47 +1289,76 @@ compileIntegralBinOp unsignedOp signedOp opName left right r = do
         (TypeChar, TypeChar) -> return unsignedOp
         _ -> typeError $ opName ++ " can only be used on matching integral or char types, not " ++ show leftType ++ " and " ++ show rightType
 
-    leftCode <- compileExpr left r
-    rr <- getReg
-    rightCode <- compileExpr right rr
-    freeReg rr
-    return $ leftCode ++ rightCode ++ [op (Reg r) (Reg rr)]
+    XR leftCode leftVal <- compileExpr left
+    XR rightCode rightVal <- compileExpr right
+    case (leftVal, rightVal) of
+        (Lit l, Lit r) -> return $ XR [] (Lit (l+r))
+        (Reg rl, Reg rr) -> do
+            freeReg rr
+            return $ XR (leftCode ++ rightCode ++ [op (Reg rl) (Reg rr)]) (Reg rl)
+        (Reg r, _) -> return $ XR (leftCode ++ [op (Reg r) rightVal]) (Reg r)
+        (_, Reg r) | commutes -> return $ XR (rightCode ++ [op (Reg r) leftVal]) (Reg r)
+        (_, _) -> do
+            r <- getReg
+            freeIfReg rightVal
+            return $ XR (leftCode ++ rightCode ++ [SET (Reg r) leftVal, op (Reg r) rightVal]) (Reg r)
 
 
-compileEqBinOp :: Opcode -> String -> Expr -> Expr -> String -> Compiler [Asm]
-compileEqBinOp opCode opName left right r = do
+compileEqBinOp :: Opcode -> String -> Expr -> Expr -> Compiler ExprResult
+compileEqBinOp opCode opName left right = do
     [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
     ass <- assignable leftType rightType
     when (not ass) $ typeError $ opName ++ " can only be used on matching integral or char types, not " ++ show leftType ++ " and " ++ show rightType
 
-    leftCode <- compileExpr left r
-    rr <- getReg
-    rightCode <- compileExpr right rr
-    freeReg rr
+    XR leftCode leftVal <- compileExpr left
+    XR rightCode rightVal <- compileExpr right
 
-    return $ leftCode ++ rightCode ++
-            [SET EX (Lit 0),
-             opCode (Reg r) (Reg rr),
-             SET EX (Lit 1),
-             SET (Reg r) EX]
+    freeIfReg leftVal
+    freeIfReg rightVal
+    r <- getReg
+    return $ XR (leftCode ++ rightCode ++ [
+            SET EX (Lit 0),
+            opCode leftVal rightVal,
+            SET EX (Lit 1),
+            SET (Reg r) EX])
+        (Reg r)
 
-compileLogicalBinOp :: Opcode -> String -> Expr -> Expr -> String -> Compiler [Asm]
-compileLogicalBinOp opCode opName left right r = do
+
+-- These operations do not commute.
+-- The right-hand side must not be computed when the left side allows short-circuiting.
+compileLogicalBinOp :: String -> Expr -> Expr -> Compiler ExprResult
+compileLogicalBinOp opName left right = do
     [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
     when (leftType /= TypeBool) $ typeError $ opName ++ " can only be applied to boolean values, but left argument has type " ++ show leftType
     when (rightType /= TypeBool) $ typeError $ opName ++ " can only be applied to boolean values, but right argument has type " ++ show rightType
 
-    leftCode <- compileExpr left r
-    rr <- getReg
-    rightCode <- compileExpr right rr
-    freeReg rr
+    XR leftCode leftVal <- compileExpr left
+    freeIfReg leftVal -- free this here, because it can be reused in the right-hand side.
+    XR rightCode rightVal <- compileExpr right
 
-    return $ leftCode ++ rightCode ++ [opCode (Reg r) (Reg rr)]
+    -- reuse the rightVal register if possible
+    r <- case (leftVal, rightVal) of
+            (_, Reg r) -> return r
+            _ -> getReg
+    freeReg r
+
+    label <- (++ "_logic_op_end") <$> uniqueLabel
+
+    -- This is the value in case of short-circuiting.
+    let shortCircuitVal = if opName == "||" then Lit 1 else Lit 0
+
+    return $ XR (leftCode ++ [
+            SET (Reg r) shortCircuitVal,
+            IFE leftVal shortCircuitVal,
+            SET PC (Label label)] ++
+            rightCode ++ [
+            SET (Reg r) rightVal]) -- If the rightVal was returned in Reg r, this will be optimized out later.
+        (Reg r)
 
 
 -- helper function for comparison operators >, <, <=, >=
-compileComparisonOp :: Opcode -> Opcode -> String -> ((String, String) -> (String, String)) -> Expr -> Expr -> String -> Compiler [Asm]
-compileComparisonOp unsignedOp signedOp opName switchOps left right r = do
+compileComparisonOp :: Opcode -> Opcode -> String -> ((Arg, Arg) -> (Arg, Arg)) -> Expr -> Expr -> Compiler ExprResult
+compileComparisonOp unsignedOp signedOp opName switchOps left right = do
     [leftType, rightType] <- mapM (underlyingType <=< typeCheck) [left, right]
     op <- case (leftType, rightType) of
         (TypeInt, TypeInt) -> return signedOp
@@ -1201,16 +1367,23 @@ compileComparisonOp unsignedOp signedOp opName switchOps left right r = do
         (TypeUint, TypeInt) -> return unsignedOp
         (TypeChar, TypeChar) -> return unsignedOp
         _ -> typeError $ opName ++ " can only be used on matching integral or char types, not " ++ show leftType ++ " and " ++ show rightType
-    leftCode <- compileExpr left r
-    rr <- getReg
-    rightCode <- compileExpr right rr
-    freeReg rr
-    let (swapR, swapRR) = switchOps (r,rr)
-    return $ leftCode ++ rightCode ++
-            [SET EX (Lit 0),
-             op (Reg swapR) (Reg swapRR),
-             SET EX (Lit 1),
-             SET (Reg r) EX]
+
+    XR leftCode leftVal_ <- compileExpr left
+    XR rightCode rightVal_ <- compileExpr right
+
+    let (leftVal, rightVal) = switchOps (leftVal_, rightVal_)
+
+    r <- case (leftVal, rightVal) of
+        (_, Reg r) -> freeIfReg leftVal >> return r
+        (Reg r, _) -> return r
+        (_, _)     -> getReg
+
+    return $ XR (leftCode ++ rightCode ++ [
+            SET EX (Lit 0),
+            op leftVal rightVal,
+            SET EX (Lit 1),
+            SET (Reg r) EX]) (Reg r)
+
 
 swap :: (a, b) -> (b, a)
 swap (a,b) = (b,a)
@@ -1231,6 +1404,7 @@ saveRegsForCall r = do
             map (\r -> SET (Reg r) POP) rs)
 
 
+
 isLvalue :: Expr -> Bool
 isLvalue (Var _) = True
 isLvalue (Selector x _) = isLvalue x
@@ -1247,18 +1421,17 @@ setVar i x = do
     assign <- assignable xt t
     when (not assign) $ typeError $ "Attempting to set the variable " ++ show i ++ " of type " ++ show t ++ " to incompatible type " ++ show xt
     -- if we get to here then the type is assignable, so compute the expression's value
-    r <- getReg
-    exprCode <- compileExpr x r
+    XR exprCode exprVal <- compileExpr x
+    freeIfReg exprVal
 
     -- location of the variable
     loc <- lookupLocation i
     storeCode <- case loc of
-        LocReg s   -> return [SET (Reg s) (Reg r)]
-        LocStack n -> return [SET (AddrRegLit "J" n) (Reg r)]
-        LocLabel l -> return [SET (AddrLabel l) (Reg r)]
+        LocReg s   -> return [SET (Reg s) exprVal]
+        LocStack n -> return [SET (AddrRegLit "J" n) exprVal]
+        LocLabel l -> return [SET (AddrLabel l) exprVal]
         LocConstant _ -> typeError $ "Attempt to assign a value to constant " ++ show i
 
-    freeReg r
     return $ exprCode ++ storeCode
 
 
@@ -1266,7 +1439,7 @@ setVar i x = do
 -- basic assembly optimizer
 -- current just removes known no-ops
 optimize :: [Asm] -> [Asm]
-optimize = filter (not.isNoop)
+optimize = map (\a -> if isNoop a then Comment a "noop" else a) --filter (not.isNoop)
 
 -- checks whether a given instruction is a no-op
 isNoop :: Asm -> Bool

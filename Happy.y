@@ -468,7 +468,7 @@ Conversion : NonPointerType OP Expression CP              { Conversion $1 $3 }
 BuiltinCall :: { Expr }
 BuiltinCall : BuiltinName OP CP                       { BuiltinCall $1 Nothing [] }
             | BuiltinName OP Type CP                  { BuiltinCall $1 (Just $3) [] }
-            | BuiltinName OP Type ExpressionList CP   { BuiltinCall $1 (Just $3) (reverse $4) }
+            | BuiltinName OP Type comma ExpressionList CP   { BuiltinCall $1 (Just $3) (reverse $5) }
             | BuiltinName OP ExpressionList CP        { BuiltinCall $1 Nothing (reverse $3) }
 
 BuiltinName :: { Token }
