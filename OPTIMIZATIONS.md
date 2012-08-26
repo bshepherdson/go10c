@@ -8,7 +8,6 @@ This file lists optimizations I have observed that can be made in the generated 
 * Assignments like `+=` and `-=` can be performed using `ADD` instead of computing and setting separately.
 * Comparison operators followed by `if` or `for` conditions can sometimes combine computing a boolean value and then checking it into a single branch instruction.
 * Multiple `SET PC, ...` lines in a row can be elided.
-* Empty functions can be optimized into a single `SET PC, POP`
 * Arguments bound for the same place need not be pushed and popped. Similarly with literals.
 * Could probably use SUB and EX to compute <, > etc., instead of four instructions.
 * Loop indices, if I can infer them, can be productively stored in registers.

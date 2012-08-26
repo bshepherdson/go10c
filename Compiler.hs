@@ -721,7 +721,14 @@ compile (StmtShortVarDecl name x) = do
     t <- typeCheck x
     addSymbol name t
     setVar name x
+
 compile (StmtFunction _ _ _ Nothing) = return []
+
+compile (StmtFunction name args ret (Just [])) = do
+    addSymbol name (TypeFunction (map snd args) ret)
+    prefix <- mkLabel name
+    return $ [LabelDef prefix, SET PC POP]
+
 compile (StmtFunction name args ret (Just body)) = do
     -- so a function. we need a new scope pushed, as well as a new set of locations for local variables and arguments.
     -- here's how the base pointer is handled. we use J as a base pointer. it points at the first local.
