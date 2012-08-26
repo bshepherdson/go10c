@@ -882,13 +882,12 @@ compile (StmtIf initializer condition ifbody elsebody) = do
     ct <- typeCheck condition
     when (ct /= TypeBool) $ typeError $ "Condition of an if statement must have type bool, found " ++ show ct
 
-    XR condCode condVal <- compileExpr condition
-    freeIfReg condVal
-
-    -- get a label prefix for this if, set 'this' appropriately.
     prefix <- uniqueLabel
-    let jumpCode = [IFE condVal (Lit 0),
-                    SET PC (Label $ if null elsebody then prefix ++ "_endif" else prefix ++ "_else")] -- jump if the condition is false, since we're jumping to the else block.
+
+    let jumpSuffix = if null elsebody then "_endif" else "_else"
+
+    condJumpCode <- compileCondition prefix jumpSuffix condition
+
     ifCode <- concat <$> mapM compile ifbody
     let ifJumpCode = if null elsebody then [] else [SET PC (Label (prefix ++ "_endif"))] -- add a jump to the end of the if body if there's an else to jump over.
 
@@ -902,7 +901,7 @@ compile (StmtIf initializer condition ifbody elsebody) = do
     -- remove the scope
     modify $ \s -> s { symbols = tail (symbols s) }
 
-    return $ initCode ++ condCode ++ jumpCode ++ ifCode ++ ifJumpCode ++ elseCode ++ [LabelDef (prefix ++ "_endif")]
+    return $ initCode ++ condJumpCode ++ ifCode ++ ifJumpCode ++ elseCode ++ [LabelDef (prefix ++ "_endif")]
 
 
 
@@ -920,10 +919,7 @@ compile (StmtFor initializer condition incrementer body) = do
     ct <- typeCheck condition
     when (ct /= TypeBool) $ typeError $ "Loop condition must have type bool, found " ++ show ct
 
-
-    XR condCode condVal <- compileExpr condition
-    let condCheckCode = [IFE condVal (Lit 0), SET PC (Label (prefix ++ "_end"))]
-    freeIfReg condVal
+    condJumpCode <- compileCondition prefix "_end" condition
 
     bodyCode <- concat <$> mapM compile body
     incCode <- concat <$> mapM compile incrementer
@@ -934,7 +930,7 @@ compile (StmtFor initializer condition incrementer body) = do
 
     modify $ \s -> s { symbols = tail (symbols s) } -- remove the new loop scope.
 
-    return $ initCode ++ topLabelCode ++ condCode ++ condCheckCode ++ bodyCode ++ incCode ++ topJumpCode ++ endLabelCode
+    return $ initCode ++ topLabelCode ++ condJumpCode ++ bodyCode ++ incCode ++ topJumpCode ++ endLabelCode
 
 
 compile (StmtReturn mx) = do
@@ -1354,6 +1350,7 @@ compileLogicalBinOp opName left right = do
     -- This is the value in case of short-circuiting.
     let shortCircuitVal = if opName == "||" then Lit 1 else Lit 0
 
+    -- If this incantation changes, fix compileCondition.
     return $ XR (leftCode ++ [
             SET (Reg r) shortCircuitVal,
             IFE leftVal shortCircuitVal,
@@ -1385,11 +1382,34 @@ compileComparisonOp unsignedOp signedOp opName switchOps left right = do
         (Reg r, _) -> return r
         (_, _)     -> getReg
 
+    -- If this incantation changes, fix compileCondition.
     return $ XR (leftCode ++ rightCode ++ [
             SET EX (Lit 0),
             op leftVal rightVal,
             SET EX (Lit 1),
             SET (Reg r) EX]) (Reg r)
+
+
+-- Compiles a condition for an if or loop. Jumps when the condition is FALSE.
+-- HACK: Married to the incantations involving EX in compileComparisonOp and compileEqBinOp.
+compileCondition :: String -> String -> Expr -> Compiler [Asm]
+compileCondition prefix suffix x@(BinOp (LOp op) _ _) | op `elem` ["<", ">", "<=", ">=", "==", "!="] = do
+    -- TODO: This might dirty a register unnecessarily, so it's less than ideal. Unlikely, though.
+    XR code val <- compileExpr x
+    freeIfReg val
+
+    let branch = head $ drop 2 $ reverse code -- grab the branch op from the incantation.
+    return [branch,
+            SET PC (Label (prefix ++ "_condTrue")),
+            SET PC (Label (prefix ++ suffix)),
+            LabelDef (prefix ++ "_condTrue")]
+
+compileCondition prefix suffix condition = do
+    XR condCode condVal <- compileExpr condition
+    freeIfReg condVal
+
+    return $ condCode ++ [IFE condVal (Lit 0),
+                          SET PC (Label (prefix++suffix))]
 
 
 swap :: (a, b) -> (b, a)
