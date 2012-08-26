@@ -745,11 +745,12 @@ compile (StmtFunction name args ret (Just body)) = do
 
     prefix <- mkLabel name
 
+    let (dirty, unused) = splitAt (min 3 (length args)) ["A", "B", "C", "X", "Y", "Z", "I"]
     let s' = s {
             locals = myLocalLocations,
             args = myArgs,
-            dirtyRegs = [],
-            freeRegs = drop (min 3 (length args)) ["A", "B", "C", "X", "Y", "Z", "I"],
+            dirtyRegs = dirty,
+            freeRegs = unused,
             symbols = mySymbols : symbols s,
             this = prefix }
 
@@ -761,13 +762,14 @@ compile (StmtFunction name args ret (Just body)) = do
     s'' <- get
 
     -- add preamble and postamble, saving and restoring the dirty registers and quitting.
-    let preambleCode  = [LabelDef prefix,
+    let regsForSaving = filter (not . (`elem` ["A", "B", "C"])) (dirtyRegs s'')
+        preambleCode  = [LabelDef prefix,
                          SET PUSH (Reg "J"),                -- store the old value of J, the base pointer.
                          SUB SP (Lit localCount),           -- make room for the locals
                          SET (Reg "J") SP] ++               -- and set J to be the new base pointer, pointing at the first local.
-                        map (SET PUSH . Reg) (dirtyRegs s'')
+                        map (SET PUSH . Reg) regsForSaving
         postambleCode = [LabelDef (prefix ++ "_done")] ++
-                        map (\r -> SET (Reg r) POP) (reverse (dirtyRegs s'')) ++
+                        map (\r -> SET (Reg r) POP) (reverse regsForSaving) ++
                         [ADD SP (Lit localCount),           -- remove the locals
                          SET (Reg "J") POP,                 -- restore the old base pointer.
                          SET PC POP]                        -- and return
@@ -1466,7 +1468,8 @@ setVar i x = do
 -- basic assembly optimizer
 -- current just removes known no-ops
 optimize :: [Asm] -> [Asm]
-optimize = map (\a -> if isNoop a then Comment a "noop" else a) --filter (not.isNoop)
+optimize = filter (not.isNoop)
+--map (\a -> if isNoop a then Comment a "noop" else a)
 
 -- checks whether a given instruction is a no-op
 isNoop :: Asm -> Bool
