@@ -1,0 +1,29 @@
+name: go10c
+version: 0.1
+license: BSD3
+license-file: LICENSE
+copyright: (c) Braden Shepherdson
+author: Braden Shepherdson
+maintainer: Braden Shepherdson
+bug-reports: https://github.com/shepheb/go10c/issues
+stability: stable
+homepage: https://github.com/shepheb/go10c
+synopsis: A compiler for Google Go targeting the DCPU-16.
+category: Development
+cabal-version: >= 1.2.3
+
+build-type: Simple
+
+executable  go10cc
+    build-depends:     base >= 4.3       && < 5
+                     , mtl >= 1.0
+                     , containers >= 0.4.2 && < 1
+                     , array >= 0.4 && < 1
+
+    build-tools: alex >= 3, happy >= 1.18.9
+    extensions: GeneralizedNewtypeDeriving
+    main-is: Compiler.hs
+    other-modules:
+        Alex
+        Happy
+        Compiler

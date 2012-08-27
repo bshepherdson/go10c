@@ -4,3 +4,4 @@
 GoParser.hs
 GoLexer.hs
 go10cc
+dist/*
