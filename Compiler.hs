@@ -774,7 +774,7 @@ compile (StmtFunction name args ret (Just body)) = do
                          SET (Reg "J") POP,                 -- restore the old base pointer.
                          SET PC POP]                        -- and return
 
-    put s -- restore the original state, removing my locals, args and symbols.
+    put $ s { strings = strings s'' } -- restore the original state, removing my locals, args and symbols, but preserving the strings.
     return $ preambleCode ++ bodyCode ++ postambleCode
 
 
