@@ -234,6 +234,13 @@ func Compile(asts []*GoFile, libraryPaths []string) []string {
 		c.typeCheckAll(pkg)
 	}
 
+	fmt.Println("Successfully parsed and typechecked.")
+	for st := c.symbols; st != nil; st = st.parent {
+		for sym, t := range st.symbols {
+			fmt.Printf("Symbol %s has type %s\n", sym, t.String())
+		}
+	}
+
 	return []string{}
 }
 

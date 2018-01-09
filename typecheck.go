@@ -355,35 +355,37 @@ func (c *Compiler) convertible(from, to *Type) bool {
 }
 
 func (e *Expression) TypeOf(c *Compiler) *Type {
-	return (*BinaryExpr)(e).TypeOf(c)
+	return (*DisjExpr)(e).TypeOf(c)
 }
 
-func (e *BinaryExpr) TypeOf(c *Compiler) *Type {
-	if e.Left == nil {
-		return e.Right.TypeOf(c)
+func (e *DisjExpr) TypeOf(c *Compiler) *Type {
+	if len(e.Parts) == 1 {
+		return e.Parts[0].TypeOf(c)
 	}
 
-	// If Left is defined, this is an || operation.
-	if lt := e.Left.TypeOf(c); lt != typeBool {
-		log.Fatalf("Left-hand side of || must be bool, found %s", lt.String())
-	}
-	if rt := e.Right.TypeOf(c); rt != typeBool {
-		log.Fatalf("Right-hand side of || must be bool, found %s", rt.String())
+	// There are multiple parts in our || operations: all expressions must be
+	// bool, return type is bool.
+	for _, expr := range e.Parts {
+		t := expr.TypeOf(c)
+		if t != typeBool {
+			log.Fatalf("Arguments to || must be bool, but found %s", t.String())
+		}
 	}
 	return typeBool
 }
 
-func (e *BinaryExpr1) TypeOf(c *Compiler) *Type {
-	if e.Left == nil {
-		return e.Right.TypeOf(c)
+func (e *ConjExpr) TypeOf(c *Compiler) *Type {
+	if len(e.Parts) == 1 {
+		return e.Parts[0].TypeOf(c)
 	}
 
-	// If Left is defined, this is a && operation.
-	if lt := e.Left.TypeOf(c); lt != typeBool {
-		log.Fatalf("Left-hand side of && must be bool, found %s", lt.String())
-	}
-	if rt := e.Right.TypeOf(c); rt != typeBool {
-		log.Fatalf("Right-hand side of && must be bool, found %s", rt.String())
+	// There are multiple parts in our && operations: all expressions must be
+	// bool, return type is bool.
+	for _, expr := range e.Parts {
+		t := expr.TypeOf(c)
+		if t != typeBool {
+			log.Fatalf("Arguments to && must be bool, but found %s", t.String())
+		}
 	}
 	return typeBool
 }
@@ -397,60 +399,56 @@ func requireMatchingIntegralTypes(lt, rt *Type, op string) {
 }
 
 // == != < <= > >= - matching sides and returns bool.
-func (e *BinaryExpr2) TypeOf(c *Compiler) *Type {
-	if e.Left == nil {
-		return e.Right.TypeOf(c)
-	}
+func (e *InequalityExpr) TypeOf(c *Compiler) *Type {
+	t := e.Base.TypeOf(c)
 
-	lt := e.Left.TypeOf(c)
-	rt := e.Right.TypeOf(c)
-	// == and != work on anything; others require int/uint.
-	if e.Op == "==" || e.Op == "!=" {
-		if !lt.equals(rt) {
-			log.Fatalf("Type mismatch in %s operation: %s does not match %s", e.Op,
-				lt.String(), rt.String())
+	for _, op := range e.Tail {
+		t2 := op.Expr.TypeOf(c)
+		if op.Op == "==" || op.Op == "!=" { // These work on anything.
+			if !t.equals(t2) {
+				log.Fatalf("Type mismatch in %s operation: %s does not match %s", op.Op,
+					t.String(), t2.String())
+			}
+		} else { // These only work on matching ints
+			requireMatchingIntegralTypes(t, t2, op.Op)
 		}
-		return typeBool
+		t = typeBool
 	}
-
-	requireMatchingIntegralTypes(lt, rt, e.Op)
-	return typeBool
+	return t
 }
 
 // + - | ^ - matching integer types
-func (e *BinaryExpr3) TypeOf(c *Compiler) *Type {
-	if e.Left == nil {
-		return e.Right.TypeOf(c)
-	}
+func (e *AdditiveExpr) TypeOf(c *Compiler) *Type {
+	t := e.Base.TypeOf(c)
 
-	lt := e.Left.TypeOf(c)
-	rt := e.Right.TypeOf(c)
-	requireMatchingIntegralTypes(lt, rt, e.Op)
-	return lt
+	for _, op := range e.Tail {
+		t2 := op.Expr.TypeOf(c)
+		requireMatchingIntegralTypes(t, t2, op.Op)
+	}
+	return t
 }
 
 // * / % & &^   matching integer types
 // << >>        int/uint << uint, returns LHS
-func (e *BinaryExpr4) TypeOf(c *Compiler) *Type {
-	if e.Left == nil {
-		return e.Right.TypeOf(c)
-	}
+func (e *MultiplicativeExpr) TypeOf(c *Compiler) *Type {
+	t := e.Base.TypeOf(c)
 
-	lt := e.Left.TypeOf(c)
-	rt := e.Right.TypeOf(c)
-	if e.Op == "<<" || e.Op == ">>" {
-		if lt != typeInt && lt != typeUint {
-			log.Fatalf("Left-hand operand of %s must be int or uint; found %s", e.Op, lt.String())
+	for _, op := range e.Tail {
+		t2 := op.Expr.TypeOf(c)
+		if op.Op == "<<" || op.Op == ">>" {
+			if t != typeInt && t != typeUint {
+				log.Fatalf("Left-hand operand of %s must be int or uint; found %s", op.Op, t.String())
+			}
+			if t2 != typeUint {
+				log.Fatalf("Right-hand operand of %s must be uint; found %s", op.Op, t2.String())
+			}
+			// t unchanged
+		} else {
+			requireMatchingIntegralTypes(t, t2, op.Op)
+			// t unchanged
 		}
-		if rt != typeUint {
-			log.Fatalf("Right-hand operand of %s must be uint; found %s", e.Op, rt.String())
-		}
-		return lt
 	}
-
-	// Otherwise, matching int types.
-	requireMatchingIntegralTypes(lt, rt, e.Op)
-	return lt
+	return t
 }
 
 // Unary + - ! ^ * & and <-
@@ -487,9 +485,68 @@ func (e *UnaryExpr) TypeOf(c *Compiler) *Type {
 	return nil
 }
 
-// A PrimaryExpr is EITHER:
-// - A SimpleOperand, Conversion call, or builtin call; OR
-// - An expression, with optionally a selector, index or call attached.
+// A Term is a PrimaryExpr followed by 0 or more index-likes.
+func (e *Term) TypeOf(c *Compiler) *Type {
+	t := e.Base.TypeOf(c)
+
+	for _, indexLike := range e.Tail {
+		if indexLike.Selector != "" {
+			// Expect et to be a struct or pointer to a struct.
+			tu := t.underlyingType(c)
+			var structType *StructType
+			if tu.Struct != nil {
+				structType = tu.Struct
+			} else if tu.Pointer != nil && tu.Pointer.Inner.Struct != nil {
+				structType = tu.Pointer.Inner.Struct
+			} else {
+				log.Fatalf("Cannot access field '%s' on non-struct type %s", indexLike.Selector, t.String())
+			}
+
+			for _, field := range structType.Fields {
+				for _, name := range field.Names {
+					if name == indexLike.Selector {
+						t = field.Type
+						continue
+					}
+				}
+			}
+			log.Fatalf("Unknown struct field '%s' on %s", indexLike.Selector, t.String())
+		} else if indexLike.Index != nil {
+			// Expect t to be an array type.
+			if t.Array == nil {
+				log.Fatalf("Cannot index into non-array type %s", t.String())
+			}
+			t = t.Array.Inner
+		} else if indexLike.Call != nil {
+			// t must be a function type, and the provided arguments must be assignable
+			// to them. Our type here is the return type, or typeVoid.
+			ft := t.Function
+			if ft == nil {
+				log.Fatalf("Cannot call non-function type %s", t.String())
+			}
+
+			if len(ft.ParamTypes) != len(indexLike.Call.Exprs) {
+				log.Fatalf("Function call expected %d arguments but got %d", len(ft.ParamTypes), len(indexLike.Call.Exprs))
+			}
+
+			for i, arg := range indexLike.Call.Exprs {
+				argType := arg.TypeOf(c)
+				if !c.assignable(argType, ft.ParamTypes[i]) {
+					log.Fatalf("Function call expected argument %d to be %s, but got %s",
+						i+1, ft.ParamTypes[i].String(), argType.String())
+				}
+			}
+
+			if ft.ReturnType == nil {
+				t = typeVoid
+			} else {
+				t = ft.ReturnType
+			}
+		}
+	}
+	return t
+}
+
 func (e *PrimaryExpr) TypeOf(c *Compiler) *Type {
 	if e.Operand != nil {
 		return e.Operand.TypeOf(c)
@@ -501,67 +558,7 @@ func (e *PrimaryExpr) TypeOf(c *Compiler) *Type {
 		return e.Builtin.TypeOf(c)
 	}
 
-	// Resolve the inner expression first.
-	et := e.Expr.TypeOf(c)
-	if e.Selector != "" {
-		// Expect et to be a struct or pointer to a struct.
-		etu := et.underlyingType(c)
-		var structType *StructType
-		if etu.Struct != nil {
-			structType = etu.Struct
-		} else if etu.Pointer != nil && etu.Pointer.Inner.Struct != nil {
-			structType = etu.Pointer.Inner.Struct
-		} else {
-			log.Fatalf("Cannot access field '%s' on non-struct type %s", e.Selector, et.String())
-		}
-
-		for _, field := range structType.Fields {
-			for _, name := range field.Names {
-				if name == e.Selector {
-					return field.Type
-				}
-			}
-		}
-		log.Fatalf("Unknown struct field '%s' on %s", e.Selector, et.String())
-		return nil
-	}
-
-	if e.Index != nil {
-		// Expect e to be an array type.
-		if et.Array == nil {
-			log.Fatalf("Cannot index into non-array type %s", et.String())
-		}
-		return et.Array.Inner
-	}
-
-	if e.Call != nil {
-		// et must be a function type, and the provided arguments must be assignable
-		// to them. Our type here is the return type, or typeVoid.
-		ft := et.Function
-		if ft == nil {
-			log.Fatalf("Cannot call non-function type %s", et.String())
-		}
-
-		if len(ft.ParamTypes) != len(e.Call.Exprs) {
-			log.Fatalf("Function call expected %d arguments but got %d", len(ft.ParamTypes), len(e.Call.Exprs))
-		}
-
-		for i, arg := range e.Call.Exprs {
-			argType := arg.TypeOf(c)
-			if !c.assignable(argType, ft.ParamTypes[i]) {
-				log.Fatalf("Function call expected argument %d to be %s, but got %s",
-					i+1, ft.ParamTypes[i].String(), argType.String())
-			}
-		}
-
-		if ft.ReturnType == nil {
-			return typeNil
-		}
-		return ft.ReturnType
-	}
-
-	// If we're still here, something went wrong.
-	log.Fatalf("Can't happen: bottom of PrimaryExpr.TypeOf.")
+	log.Fatalf("Can't happen: bottom of PrimaryExpr")
 	return typeNil
 }
 

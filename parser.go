@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io/ioutil"
 	"log"
 
@@ -39,7 +40,7 @@ type ConstDecl struct {
 
 type ShortVarDecl struct {
 	Names []string      `@Ident { "," @Ident }`
-	Exprs []*Expression `@@ { "," @@ }`
+	Exprs []*Expression `":=" @@ { "," @@ }`
 }
 
 type TypeDecl struct {
@@ -87,7 +88,7 @@ type FuncDecl struct {
 	Name       string          `"func" @Ident`
 	Args       []*NamesAndType `"(" (")" | @@ { "," @@ } ")")`
 	ReturnType *Type           `[@@]`
-	Body       []*Statement    `"{" { @@ } "}"`
+	Body       []*Statement    `"{" {@@} "}"`
 }
 
 // Represents, eg.    x, y, z Type
@@ -100,7 +101,6 @@ type NamesAndType struct {
 type Statement struct {
 	Decl     *Declaration  `  @@`
 	Labeled  *LabeledStmt  `| @@`
-	Simple   *SimpleStmt   `| @@`
 	Return   *ReturnStmt   `| @@`
 	Continue *ContinueStmt `| @@`
 	Goto     *GotoStmt     `| @@`
@@ -108,7 +108,8 @@ type Statement struct {
 	Block []*Statement `| ("{" { @@ } "}")`
 	If    *IfStmt      `| @@`
 	//Switch      *SwitchStmt   `| @@`
-	For *ForStmt `| @@`
+	For    *ForStmt    `| @@`
+	Simple *SimpleStmt `| @@`
 }
 
 type LabeledStmt struct {
@@ -117,10 +118,10 @@ type LabeledStmt struct {
 }
 
 type SimpleStmt struct {
-	Expr      *Expression   `  @@`
-	IncDec    *IncDecStmt   `| @@`
+	IncDec    *IncDecStmt   `  @@`
 	Assign    *Assignment   `| @@`
 	ShortDecl *ShortVarDecl `| @@`
+	Expr      *Expression   `| @@`
 }
 
 type IncDecStmt struct {
@@ -130,7 +131,7 @@ type IncDecStmt struct {
 
 type Assignment struct {
 	Lhs []*Expression `@@ { "," @@ }`
-	Op  string        `("=" | "+=" | "-=" | "|=" | "^=" | "*=" | "/=" | "%=" | "&=" | "&^=" | "<<=" | ">>=")`
+	Op  string        `@("=" | "+=" | "-=" | "|=" | "^=" | "*=" | "/=" | "%=" | "&=" | "&^=" | "<<=" | ">>=")`
 	Rhs []*Expression `@@ { "," @@ }`
 }
 
@@ -171,49 +172,67 @@ type ForClause struct {
 }
 
 // Expressions
-type Expression BinaryExpr
+type Expression DisjExpr
 
-type BinaryExpr struct {
-	Left  *BinaryExpr  `(@@ "||"`
-	Right *BinaryExpr1 `@@) | @@`
+type DisjExpr struct {
+	Parts []*ConjExpr `@@ { "||" @@ }`
 }
 
-type BinaryExpr1 struct {
-	Left  *BinaryExpr1 `(@@ "&&"`
-	Right *BinaryExpr2 `@@) | @@`
+type ConjExpr struct {
+	Parts []*InequalityExpr `@@ { "&&" @@ }`
 }
 
-type BinaryExpr2 struct {
-	Left  *BinaryExpr2 `(@@`
-	Op    string       `@("==" | "!=" | "<" | ">" | "<=" | ">=")`
-	Right *BinaryExpr3 `@@) | @@`
+type InequalityExpr struct {
+	Base *AdditiveExpr        `@@`
+	Tail []*InequalityOperand `{ @@ }`
 }
 
-type BinaryExpr3 struct {
-	Left  *BinaryExpr3 `(@@`
-	Op    string       `@("+" | "-" | "|" | "^")`
-	Right *BinaryExpr4 `@@) | @@`
+type InequalityOperand struct {
+	Op   string `@("==" | "!=" | "<" | ">" | "<=" | ">=")`
+	Expr *AdditiveExpr
 }
 
-type BinaryExpr4 struct {
-	Left  *BinaryExpr4 `(@@`
-	Op    string       `@("*" | "/" | "%" | "&" | "<<" | ">>" | "&^")`
-	Right *UnaryExpr   `@@) | @@`
+type AdditiveExpr struct {
+	Base *MultiplicativeExpr `@@`
+	Tail []*AdditiveOperand  `{ @@ }`
+}
+
+type AdditiveOperand struct {
+	Op   string              `@("+" | "-" | "|" | "^")`
+	Expr *MultiplicativeExpr `@@`
+}
+
+type MultiplicativeExpr struct {
+	Base *UnaryExpr               `@@`
+	Tail []*MultiplicativeOperand `{ @@ }`
+}
+
+type MultiplicativeOperand struct {
+	Op   string     `@("*" | "/" | "%" | "&" | "<<" | ">>" | "&^")`
+	Expr *UnaryExpr `@@`
 }
 
 type UnaryExpr struct {
-	Op   string       `@["+" | "-" | "!" | "^" | "*" | "&" | "<-"]`
-	Expr *PrimaryExpr `@@`
+	Op   string `@["+" | "-" | "!" | "^" | "*" | "&" | "<-"]`
+	Expr *Term  `@@`
+}
+
+type Term struct {
+	Base *PrimaryExpr  `@@`
+	Tail []*IndexLikes `{@@}`
+}
+
+// Calls, .field, and [index].
+type IndexLikes struct {
+	Selector string          `("." @Ident)`
+	Index    *Expression     `| ("[" @@ "]")`
+	Call     *ExpressionList `| ("(" @@ ")")`
 }
 
 type PrimaryExpr struct {
-	Operand    *SimpleOperand  `  @@`
-	Conversion *Conversion     `| @@`
-	Builtin    *BuiltinCall    `| @@`
-	Expr       *PrimaryExpr    `| (@@`
-	Selector   string          `( ("." @Ident)`
-	Index      *Expression     `| ("[" @@ "]")`
-	Call       *ExpressionList `| ("(" @@ ")")))`
+	Operand    *SimpleOperand `  @@`
+	Conversion *Conversion    `| @@`
+	Builtin    *BuiltinCall   `| @@`
 }
 
 type SimpleOperand struct {
@@ -277,6 +296,7 @@ func buildParser() *participle.Parser {
 	if parser == nil {
 		var err error
 		parser, err = participle.Build(&GoFile{}, nil)
+		fmt.Println(parser.String())
 		if err != nil {
 			log.Fatal("Error building parser: %v\n", err)
 		}
