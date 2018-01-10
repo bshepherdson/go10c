@@ -3,32 +3,29 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
+	"go/ast"
+	"go/token"
 
 	"github.com/davecgh/go-spew/spew"
 )
 
 func main() {
-	outputFile := flag.String("o", "out.asm", "File name for the generated DCPU-16 assembly code")
+	//outputFile := flag.String("o", "out.asm", "File name for the generated DCPU-16 assembly code")
 	flag.Parse()
 
 	inputFiles := flag.Args()
-	code := make([]*GoFile, 0)
+	fset := token.NewFileSet()
+	code := map[string]*ast.File{}
 	for _, f := range inputFiles {
-		c, err := Parse(f)
+		c, err := Parse(fset, f)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 
-		code = append(code, c)
+		code[f] = c
 	}
 
-	Compile(code, []string{})
-
-	f, err := os.Create(*outputFile)
-	if err != nil {
-		panic(err)
-	}
-	spew.Fdump(f, code)
+	output := Compile(code, fset, []string{})
+	spew.Dump(output)
 }

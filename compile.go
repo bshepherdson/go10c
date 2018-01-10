@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"go/ast"
+	"go/token"
 	"log"
 	"os"
 	"path"
@@ -28,17 +30,16 @@ import (
 // saved value 2
 // saved value 1  <-- SP
 
-type SymbolTable struct {
-	parent  *SymbolTable
-	symbols map[string]*Type
-}
+// One of these values will be non-nil.
 
 type Compiler struct {
+	fset         *token.FileSet
 	packages     map[string]*Package
+	namespaces   map[string]*Namespace
 	symbols      *SymbolTable // The current context's symbols.
 	regs         *RegisterState
 	strings      map[string]string    // String literals to write into the binary.
-	types        map[string]*Type     // Holds type aliases
+	types        map[string]Type      // Holds type aliases
 	args         map[string]*Location // Argument names and their current locations.
 	locals       map[string]*Location // Local variables and their current locations.
 	globals      map[string]*Location // Global variables and their current locations.
@@ -47,6 +48,11 @@ type Compiler struct {
 	this         string               // Name of the current function being compiled, used for labels.
 	packageName  string               // Current package name.
 	unique       int                  // Counter for unique labels.
+}
+
+type Namespace struct {
+	Symbols *SymbolTable
+	Types   map[string]Type
 }
 
 type Location interface {
@@ -177,11 +183,12 @@ func (a *Arg) Output() string {
 
 func newCompiler() *Compiler {
 	c := new(Compiler)
+	c.namespaces = map[string]*Namespace{}
 	c.packages = map[string]*Package{}
 	c.symbols = newSymbolTable(nil)
 	c.regs = newRegisterState()
 	c.strings = map[string]string{}
-	c.types = map[string]*Type{}
+	c.types = map[string]Type{}
 	c.globals = map[string]*Location{}
 	c.initializers = make([]*Asm, 0, 256)
 	c.code = make([]*Asm, 0, 4096)
@@ -189,48 +196,38 @@ func newCompiler() *Compiler {
 	return c
 }
 
-type Package struct {
-	symbols *SymbolTable
-	types   map[string]*Type
-}
-
 // Turns a block of parsed files into the output.
-func Compile(asts []*GoFile, libraryPaths []string) []string {
+func Compile(files map[string]*ast.File, fset *token.FileSet, libraryPaths []string) []string {
 	c := newCompiler()
 	c.args = map[string]*Location{}
 
 	// First pass: Build packages across their multiple files.
-	packages := map[string]*GoFile{}
-	for _, f := range asts {
-		if p, ok := packages[f.Package]; ok {
-			p.Imports = append(p.Imports, f.Imports...)
-			p.Decls = append(p.Decls, f.Decls...)
-		} else {
-			packages[f.Package] = f
-		}
+	pkg, err := ast.NewPackage(fset, files, nil, nil)
+	if err != nil {
+		log.Fatal(err)
 	}
+
+	merged := ast.MergePackageFiles(pkg, ast.FilterImportDuplicates)
 
 	// Second pass: For each package, recursively expand its imports.
 	// We collect just the top-level packages first, then expand them, since it
 	// isn't safe to modify the packages map while iterating over it.
-	originals := make([]*GoFile, 0, len(packages))
-	for _, p := range packages {
-		originals = append(originals, p)
-	}
-	for _, p := range originals {
-		importClosure(p, libraryPaths, packages)
-	}
+	packages := map[string]*ast.File{}
+	importClosure(merged, fset, libraryPaths, packages)
 
 	// Third pass: Collecting all the global symbols.
 	// Take their word for their types for now. Typechecking will catch the liars.
-	for pkgName, pkg := range packages {
+	for pkgName, file := range packages {
 		c.packageName = pkgName
 		baseName := strings.Split(pkgName, "/")
-		c.packages[baseName[len(baseName)-1]] = c.collectSymbols(pkg)
+		pkg := astPackage(file)
+		syms, types := collectSymbols(pkg)
+		c.packages[baseName[len(baseName)-1]] = pkg
+		c.namespaces[baseName[len(baseName)-1]] = &Namespace{Symbols: syms, Types: types}
 	}
 
 	// Fourth pass: Type checking all the symbols.
-	for _, pkg := range packages {
+	for _, pkg := range c.packages {
 		c.typeCheckAll(pkg)
 	}
 
@@ -245,14 +242,15 @@ func Compile(asts []*GoFile, libraryPaths []string) []string {
 }
 
 // Recursively includes all the packages imported by the given package.
-func importClosure(pkg *GoFile, libraryPaths []string, packages map[string]*GoFile) {
+func importClosure(pkg *ast.File, fset *token.FileSet, libraryPaths []string, packages map[string]*ast.File) {
 	for _, i := range pkg.Imports {
-		if _, ok := packages[i]; ok {
+		pkgPath := i.Path.Value
+		if _, ok := packages[pkgPath]; ok {
 			continue // Found it already loaded.
 		}
 
 		// Otherwise, look for libraryPaths[x] + "/" + i to be a directory.
-		importParts := strings.Split(i, "/") // Always /, not system separators.
+		importParts := strings.Split(pkgPath, "/") // Always /, not system separators.
 		importParts = append([]string{""}, importParts...)
 		for _, p := range libraryPaths {
 			importParts[0] = p
@@ -265,7 +263,7 @@ func importClosure(pkg *GoFile, libraryPaths []string, packages map[string]*GoFi
 
 			// Found our import! Parse all the *.go files and add them as a new
 			// package.
-			imp := &GoFile{Package: i}
+			importedFiles := map[string]*ast.File{}
 			dir, err := os.Open(dirName)
 			if err != nil {
 				log.Fatalf("error reading imports from %s: %v", dirName, err)
@@ -277,18 +275,29 @@ func importClosure(pkg *GoFile, libraryPaths []string, packages map[string]*GoFi
 			}
 			for _, filename := range contents {
 				if path.Ext(filename) == "go" {
-					g, err := Parse(filename)
+					g, err := Parse(fset, filename)
 					if err != nil {
 						log.Fatalf("parse error in imported library %s: %v", i, err)
 					}
-					imp.Imports = append(imp.Imports, g.Imports...)
-					imp.Decls = append(imp.Decls, g.Decls...)
+					importedFiles[filename] = g
 				}
 			}
 
-			packages[i] = imp
-			importClosure(imp, libraryPaths, packages)
+			pkg, err := ast.NewPackage(fset, importedFiles, nil, nil)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			merged := ast.MergePackageFiles(pkg, ast.FilterImportDuplicates)
+			packages[i.Name.Name] = merged
+			importClosure(merged, fset, libraryPaths, packages)
 			break
 		}
 	}
+}
+
+func (c *Compiler) typeError(ast AST, format string, args ...interface{}) {
+	pos := c.fset.Position(ast.Loc())
+	args = append([]interface{}{pos.Filename, pos.Line, pos.Column}, args...)
+	log.Fatalf("%s:%d:%d:  "+format, args...)
 }
