@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/token"
 	"log"
+
+	"github.com/davecgh/go-spew/spew"
 )
 
 // Since we cannot declare methods on foreign types, we follow parsing with a
@@ -78,42 +80,63 @@ func astPackage(f *ast.File) *Package {
 
 // ast.Decl is eg. a var (...) block, with an []Spec, where Spec is ImportSpec,
 // ValueSpec, TypeSpec or ValueSpec.
-func astDecl(d ast.Decl) []Decl {
-	gd, ok := d.(*ast.GenDecl)
-	if !ok {
-		panic("Y U NO GenDecl")
+// Or it might be an ast.FuncDecl.
+func astDecl(di ast.Decl) []Decl {
+	switch d := di.(type) {
+	case *ast.GenDecl:
+		switch d.Tok {
+		case token.TYPE:
+			decls := []Decl{}
+			for _, spec := range d.Specs {
+				if ts, ok := spec.(*ast.TypeSpec); ok {
+					// ts.Name, ts.Type
+					td := &TypeDecl{Pos: d.TokPos, Name: ts.Name.Name, Type: astType(ts.Type)}
+					decls = append(decls, td)
+				} else {
+					log.Fatalf("Can't happen, token.TYPE but not TypeSpec")
+				}
+			}
+			return decls
+		case token.VAR:
+			decls := []Decl{}
+			for _, spec := range d.Specs {
+				if ts, ok := spec.(*ast.ValueSpec); ok {
+					// ts.Names, ts.Type, ts.Values
+					t := astType(ts.Type)
+					for i, ident := range ts.Names {
+						decls = append(decls, &VarDecl{Pos: ts.Pos(), Name: ident.Name, Type: t, Value: astExpr(ts.Values[i])})
+					}
+				} else {
+					log.Fatalf("Can't happen, token.TYPE but not TypeSpec")
+				}
+			}
+			return decls
+		}
+
+	case *ast.FuncDecl:
+		f := &FuncDecl{Pos: d.Pos(), Name: d.Name.Name}
+		if d.Recv != nil && len(d.Recv.List) > 0 {
+			field := d.Recv.List[0]
+			f.Receiver = astField(field)
+		}
+
+		for _, field := range d.Type.Params.List {
+			f.Args = append(f.Args, astField(field))
+		}
+
+		return []Decl{f}
 	}
 
-	switch gd.Tok {
-	case token.TYPE:
-		decls := []Decl{}
-		for _, spec := range gd.Specs {
-			if ts, ok := spec.(*ast.TypeSpec); ok {
-				// ts.Name, ts.Type
-				td := &TypeDecl{Name: ts.Name.Name, Type: astType(ts.Type)}
-				decls = append(decls, td)
-			} else {
-				log.Fatalf("Can't happen, token.TYPE but not TypeSpec")
-			}
-		}
-		return decls
-	case token.VAR:
-		decls := []Decl{}
-		for _, spec := range gd.Specs {
-			if ts, ok := spec.(*ast.ValueSpec); ok {
-				// ts.Names, ts.Type, ts.Values
-				t := astType(ts.Type)
-				for i, ident := range ts.Names {
-					decls = append(decls, &VarDecl{Name: ident.Name, Type: t, Value: astExpr(ts.Values[i])})
-				}
-			} else {
-				log.Fatalf("Can't happen, token.TYPE but not TypeSpec")
-			}
-		}
-		return decls
-	}
 	log.Fatalf("Can't happen: bottom of astDecl")
 	return []Decl{}
+}
+
+func astField(f *ast.Field) *VarSpec {
+	v := &VarSpec{Type: astType(f.Type)}
+	for _, name := range f.Names {
+		v.Names = append(v.Names, name.Name)
+	}
+	return v
 }
 
 func astType(ti ast.Expr) Type {
@@ -156,7 +179,12 @@ func astType(ti ast.Expr) Type {
 		}
 
 		return st
+
+	case *ast.Ident:
+		return &NamedType{Name: t.Name}
 	}
+
+	spew.Dump(ti)
 	log.Fatalf("Bottom of astType")
 	return nil
 }

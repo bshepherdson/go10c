@@ -13,6 +13,10 @@ func (t *TypeDecl) TypeCheck(c *Compiler) {
 	// Nothing to check here.
 }
 
+func (f *FuncDecl) TypeCheck(c *Compiler) {
+	// TODO: Check the body.
+}
+
 func (c *Compiler) typeCheckAll(pkg *Package) {
 	// TODO
 }

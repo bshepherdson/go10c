@@ -274,3 +274,7 @@ func (t *NamedType) Underlying() Type {
 	log.Fatalf("Unknown named type %s", t.Name)
 	return nil
 }
+
+func (t *NamedType) String() string {
+	return t.Name
+}

@@ -8,6 +8,8 @@ import (
 	"os"
 	"path"
 	"strings"
+
+	"github.com/davecgh/go-spew/spew"
 )
 
 // Compiled output notes:
@@ -196,13 +198,22 @@ func newCompiler() *Compiler {
 	return c
 }
 
+func mkScope() *ast.Scope {
+	s := ast.NewScope(nil)
+	s.Insert(ast.NewObj(ast.Typ, "int"))
+	s.Insert(ast.NewObj(ast.Typ, "uint"))
+	s.Insert(ast.NewObj(ast.Typ, "string"))
+	s.Insert(ast.NewObj(ast.Typ, "bool"))
+	return s
+}
+
 // Turns a block of parsed files into the output.
 func Compile(files map[string]*ast.File, fset *token.FileSet, libraryPaths []string) []string {
 	c := newCompiler()
 	c.args = map[string]*Location{}
 
 	// First pass: Build packages across their multiple files.
-	pkg, err := ast.NewPackage(fset, files, nil, nil)
+	pkg, err := ast.NewPackage(fset, files, nil, mkScope())
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -212,7 +223,7 @@ func Compile(files map[string]*ast.File, fset *token.FileSet, libraryPaths []str
 	// Second pass: For each package, recursively expand its imports.
 	// We collect just the top-level packages first, then expand them, since it
 	// isn't safe to modify the packages map while iterating over it.
-	packages := map[string]*ast.File{}
+	packages := map[string]*ast.File{".": merged}
 	importClosure(merged, fset, libraryPaths, packages)
 
 	// Third pass: Collecting all the global symbols.
@@ -228,6 +239,7 @@ func Compile(files map[string]*ast.File, fset *token.FileSet, libraryPaths []str
 
 	// Fourth pass: Type checking all the symbols.
 	for _, pkg := range c.packages {
+		spew.Dump(pkg)
 		c.typeCheckAll(pkg)
 	}
 
