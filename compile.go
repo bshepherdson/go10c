@@ -233,7 +233,7 @@ func Compile(files map[string]*ast.File, fset *token.FileSet, libraryPaths []str
 	for pkgName, file := range packages {
 		c.packageName = pkgName
 		baseName := strings.Split(pkgName, "/")
-		pkg := astPackage(file)
+		pkg := astPackage(file, c)
 		syms, types := collectSymbols(pkg)
 		c.packages[baseName[len(baseName)-1]] = pkg
 		c.namespaces[baseName[len(baseName)-1]] = &Namespace{Symbols: syms, Types: types}

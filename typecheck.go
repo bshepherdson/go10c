@@ -272,6 +272,49 @@ func (e *CallExpr) TypeOf(c *Compiler) Type {
 	return ft.ReturnType // Nil if no return value, which serves to signal void.
 }
 
+// Expr must be a map or an array. Since maps are not supported, it's just
+// arrays.
+func (e *IndexExpr) TypeOf(c *Compiler) Type {
+	t := e.Expr.TypeOf(c)
+	tu := t.Underlying()
+	it := e.Index.TypeOf(c)
+	itu := it.Underlying()
+	if at, ok := tu.(*ArrayType); ok {
+		if itu.Equals(typeInt) || itu.Equals(typeUint) {
+			return at.Inner
+		}
+		c.typeError(e.Index, "Index type must be int or uint, but found %s", it.String())
+	}
+	c.typeError(e, "Cannot index non-array type %s", t.String())
+	return nil
+}
+
+// Expr must be a struct, so we can access fields on it.
+func (s *SelectorExpr) TypeOf(c *Compiler) Type {
+	t := s.Expr.TypeOf(c)
+	tu := t.Underlying()
+	st, ok := tu.(*StructType)
+	if !ok {
+		if pt, ok_ := tu.(*PointerType); ok_ {
+			st, ok = pt.Inner.Underlying().(*StructType)
+		}
+	}
+
+	if ok {
+		// Check for a field with that name.
+		for _, field := range st.Fields {
+			for _, name := range field.Names {
+				if name == s.Selector {
+					return field.Type
+				}
+			}
+		}
+		c.typeError(s, "%s has no field '%s'", t.String(), s.Selector)
+	}
+	c.typeError(s, "Cannot access field of non-struct type %s", t.String())
+	return nil
+}
+
 func matchingInts(lt, rt Type) bool {
 	return (lt.Equals(typeInt) && rt.Equals(typeInt)) ||
 		(lt.Equals(typeUint) && rt.Equals(typeUint)) ||

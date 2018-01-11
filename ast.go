@@ -5,6 +5,8 @@ import (
 	"go/token"
 	"log"
 	"strconv"
+
+	"github.com/davecgh/go-spew/spew"
 )
 
 // Since we cannot declare methods on foreign types, we follow parsing with a
@@ -178,10 +180,24 @@ type CallExpr struct {
 	Args []Expr
 }
 
-func astPackage(f *ast.File) *Package {
+// foo[bar]
+type IndexExpr struct {
+	Pos   token.Pos
+	Expr  Expr
+	Index Expr
+}
+
+// foo.bar
+type SelectorExpr struct {
+	Pos      token.Pos
+	Expr     Expr
+	Selector string
+}
+
+func astPackage(f *ast.File, c *Compiler) *Package {
 	p := &Package{Pos: f.Package, Name: f.Name.Name}
 	for _, d := range f.Decls {
-		d2 := astDecl(d)
+		d2 := astDecl(d, c)
 		if d2 != nil {
 			p.Decls = append(p.Decls, d2...)
 		}
@@ -192,7 +208,7 @@ func astPackage(f *ast.File) *Package {
 // ast.Decl is eg. a var (...) block, with an []Spec, where Spec is ImportSpec,
 // ValueSpec, TypeSpec or ValueSpec.
 // Or it might be an ast.FuncDecl.
-func astDecl(di ast.Decl) []Decl {
+func astDecl(di ast.Decl, c *Compiler) []Decl {
 	switch d := di.(type) {
 	case *ast.GenDecl:
 		switch d.Tok {
@@ -201,7 +217,7 @@ func astDecl(di ast.Decl) []Decl {
 			for _, spec := range d.Specs {
 				if ts, ok := spec.(*ast.TypeSpec); ok {
 					// ts.Name, ts.Type
-					td := &TypeDecl{Pos: d.TokPos, Name: ts.Name.Name, Type: astType(ts.Type)}
+					td := &TypeDecl{Pos: d.TokPos, Name: ts.Name.Name, Type: astType(ts.Type, c)}
 					decls = append(decls, td)
 				} else {
 					log.Fatalf("Can't happen, token.TYPE but not TypeSpec")
@@ -213,7 +229,7 @@ func astDecl(di ast.Decl) []Decl {
 			for _, spec := range d.Specs {
 				if ts, ok := spec.(*ast.ValueSpec); ok {
 					// ts.Names, ts.Type, ts.Values
-					t := astType(ts.Type)
+					t := astType(ts.Type, c)
 					for i, ident := range ts.Names {
 						vd := &VarDecl{Pos: ts.Pos(), Name: ident.Name, Type: t}
 						if ts.Values != nil && len(ts.Values) > 0 {
@@ -232,11 +248,11 @@ func astDecl(di ast.Decl) []Decl {
 		f := &FuncDecl{Pos: d.Pos(), Name: d.Name.Name}
 		if d.Recv != nil && len(d.Recv.List) > 0 {
 			field := d.Recv.List[0]
-			f.Receiver = astField(field)
+			f.Receiver = astField(field, c)
 		}
 
 		for _, field := range d.Type.Params.List {
-			f.Args = append(f.Args, astField(field))
+			f.Args = append(f.Args, astField(field, c))
 		}
 
 		for _, stmt := range d.Body.List {
@@ -247,7 +263,7 @@ func astDecl(di ast.Decl) []Decl {
 			if len(d.Type.Results.List) > 1 {
 				log.Fatalf("Multiple return values are not supported")
 			} else if len(d.Type.Results.List) == 1 {
-				f.ReturnType = astType(d.Type.Results.List[0].Type)
+				f.ReturnType = astType(d.Type.Results.List[0].Type, c)
 			}
 		}
 
@@ -258,19 +274,19 @@ func astDecl(di ast.Decl) []Decl {
 	return []Decl{}
 }
 
-func astField(f *ast.Field) *VarSpec {
-	v := &VarSpec{Type: astType(f.Type)}
+func astField(f *ast.Field, c *Compiler) *VarSpec {
+	v := &VarSpec{Type: astType(f.Type, c)}
 	for _, name := range f.Names {
 		v.Names = append(v.Names, name.Name)
 	}
 	return v
 }
 
-func astType(ti ast.Expr) Type {
+func astType(ti ast.Expr, c *Compiler) Type {
 	switch t := ti.(type) {
 	case *ast.ArrayType:
 		// We don't support lengths, so we can ignore that clause.
-		return &ArrayType{Inner: astType(t.Elt)}
+		return &ArrayType{Inner: astType(t.Elt, c)}
 
 	case *ast.FuncType:
 		if len(t.Results.List) > 1 || (len(t.Results.List) == 1 && len(t.Results.List[0].Names) > 1) {
@@ -278,7 +294,7 @@ func astType(ti ast.Expr) Type {
 		}
 		theType := &FuncType{}
 		for _, f := range t.Params.List {
-			t2 := astType(f.Type)
+			t2 := astType(f.Type, c)
 			for range f.Names {
 				theType.Args = append(theType.Args, t2)
 			}
@@ -288,7 +304,7 @@ func astType(ti ast.Expr) Type {
 			if t.Results.List[0].Names[0] != nil {
 				log.Fatalf("Named return values are not supported")
 			}
-			theType.ReturnType = astType(t.Results.List[0].Type)
+			theType.ReturnType = astType(t.Results.List[0].Type, c)
 		}
 		return theType
 
@@ -299,7 +315,7 @@ func astType(ti ast.Expr) Type {
 		}
 
 		for _, f := range t.Fields.List {
-			vs := &VarSpec{Type: astType(f.Type)}
+			vs := &VarSpec{Type: astType(f.Type, c)}
 			for _, n := range f.Names {
 				vs.Names = append(vs.Names, n.Name)
 			}
@@ -308,13 +324,17 @@ func astType(ti ast.Expr) Type {
 
 		return st
 
+	case *ast.StarExpr: // Pointer to another type.
+		return &PointerType{Inner: astType(t.X, c)}
+
 	case *ast.Ident:
 		if t.Name == "int" || t.Name == "uint" || t.Name == "char" || t.Name == "bool" || t.Name == "string" {
 			return BuiltinType(t.Name)
 		}
-		return &NamedType{Name: t.Name}
+		return &NamedType{Name: t.Name, Compiler: c}
 	}
 
+	spew.Dump(ti)
 	log.Fatalf("Bottom of astType")
 	return nil
 }
@@ -420,6 +440,15 @@ func astExpr(expr ast.Expr) Expr {
 		}
 		return e
 
+	case *ast.IndexExpr:
+		return &IndexExpr{Pos: x.Lbrack, Expr: astExpr(x.X), Index: astExpr(x.Index)}
+
+	case *ast.SelectorExpr:
+		return &SelectorExpr{Pos: x.Sel.Pos(), Expr: astExpr(x.X), Selector: x.Sel.Name}
+
+	case *ast.ParenExpr:
+		return astExpr(x.X)
+
 	case *ast.Ident:
 		return astIdent(x)
 	}
@@ -438,18 +467,22 @@ func (a *AssignStmt) Loc() token.Pos { return a.Pos }
 func (a *ReturnStmt) Loc() token.Pos { return a.Pos }
 func (a *ExprStmt) Loc() token.Pos   { return a.Pos }
 
-func (a *Ident) Loc() token.Pos      { return a.Pos }
-func (a *NumLit) Loc() token.Pos     { return a.Pos }
-func (a *CharLit) Loc() token.Pos    { return a.Pos }
-func (a *StringLit) Loc() token.Pos  { return a.Pos }
-func (a *UnaryExpr) Loc() token.Pos  { return a.Pos }
-func (a *BinaryExpr) Loc() token.Pos { return a.Pos }
-func (a *CallExpr) Loc() token.Pos   { return a.Pos }
+func (a *Ident) Loc() token.Pos        { return a.Pos }
+func (a *NumLit) Loc() token.Pos       { return a.Pos }
+func (a *CharLit) Loc() token.Pos      { return a.Pos }
+func (a *StringLit) Loc() token.Pos    { return a.Pos }
+func (a *UnaryExpr) Loc() token.Pos    { return a.Pos }
+func (a *BinaryExpr) Loc() token.Pos   { return a.Pos }
+func (a *CallExpr) Loc() token.Pos     { return a.Pos }
+func (a *IndexExpr) Loc() token.Pos    { return a.Pos }
+func (a *SelectorExpr) Loc() token.Pos { return a.Pos }
 
-func (x *Ident) Lvalue() bool      { return true }
-func (x *NumLit) Lvalue() bool     { return false }
-func (x *CharLit) Lvalue() bool    { return false }
-func (x *StringLit) Lvalue() bool  { return false }
-func (x *UnaryExpr) Lvalue() bool  { return false }
-func (x *BinaryExpr) Lvalue() bool { return false }
-func (x *CallExpr) Lvalue() bool   { return false }
+func (x *Ident) Lvalue() bool        { return true }
+func (a *IndexExpr) Lvalue() bool    { return true }
+func (a *SelectorExpr) Lvalue() bool { return true }
+func (x *NumLit) Lvalue() bool       { return false }
+func (x *CharLit) Lvalue() bool      { return false }
+func (x *StringLit) Lvalue() bool    { return false }
+func (x *UnaryExpr) Lvalue() bool    { return false }
+func (x *BinaryExpr) Lvalue() bool   { return false }
+func (x *CallExpr) Lvalue() bool     { return false }
