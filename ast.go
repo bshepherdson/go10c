@@ -88,11 +88,13 @@ type BranchStmt struct {
 }
 
 type DeclStmt struct {
+	Pos  token.Pos
 	Decl *VarDecl
 }
 
 // An expression on its own line; generally this is a call.
 type ExprStmt struct {
+	Pos  token.Pos
 	Expr Expr
 }
 
@@ -161,6 +163,19 @@ type UnaryExpr struct {
 	Pos  token.Pos
 	Op   token.Token
 	Expr Expr
+}
+
+type BinaryExpr struct {
+	Pos token.Pos
+	Lhs Expr
+	Op  token.Token
+	Rhs Expr
+}
+
+type CallExpr struct {
+	Pos  token.Pos
+	Fun  Expr
+	Args []Expr
 }
 
 func astPackage(f *ast.File) *Package {
@@ -309,6 +324,9 @@ func astStmt(iStmt ast.Stmt) Statement {
 	case *ast.AssignStmt:
 		return astAssignStmt(stmt)
 
+	case *ast.ExprStmt:
+		return &ExprStmt{Pos: stmt.Pos(), Expr: astExpr(stmt.X)}
+
 		/*
 			case *ast.BlockStmt:
 				b := &BlockStmt{Pos: stmt.Lbrace}
@@ -330,9 +348,6 @@ func astStmt(iStmt ast.Stmt) Statement {
 					return &DeclStmt{vd}
 				}
 				log.Fatal("Cannot declare types or functions inside functions.")
-
-			case *ast.ExprStmt:
-				return &ExprStmt{Expr: astExpr(stmt.X)}
 
 			case *ast.ForStmt:
 				return astForStmt(stmt)
@@ -392,6 +407,19 @@ func astExpr(expr ast.Expr) Expr {
 	case *ast.UnaryExpr:
 		return &UnaryExpr{Pos: x.OpPos, Op: x.Op, Expr: astExpr(x.X)}
 
+	case *ast.BinaryExpr:
+		return &BinaryExpr{Pos: x.OpPos, Lhs: astExpr(x.X), Op: x.Op, Rhs: astExpr(x.Y)}
+
+	case *ast.CallExpr:
+		e := &CallExpr{Pos: x.Lparen, Fun: astExpr(x.Fun)}
+		if x.Ellipsis != token.NoPos {
+			log.Fatalf("Ellipsis (...) in functions is not supported")
+		}
+		for _, a := range x.Args {
+			e.Args = append(e.Args, astExpr(a))
+		}
+		return e
+
 	case *ast.Ident:
 		return astIdent(x)
 	}
@@ -408,15 +436,20 @@ func (a *FuncDecl) Loc() token.Pos   { return a.Pos }
 func (a *TypeDecl) Loc() token.Pos   { return a.Pos }
 func (a *AssignStmt) Loc() token.Pos { return a.Pos }
 func (a *ReturnStmt) Loc() token.Pos { return a.Pos }
+func (a *ExprStmt) Loc() token.Pos   { return a.Pos }
 
-func (a *Ident) Loc() token.Pos     { return a.Pos }
-func (a *NumLit) Loc() token.Pos    { return a.Pos }
-func (a *CharLit) Loc() token.Pos   { return a.Pos }
-func (a *StringLit) Loc() token.Pos { return a.Pos }
-func (a *UnaryExpr) Loc() token.Pos { return a.Pos }
+func (a *Ident) Loc() token.Pos      { return a.Pos }
+func (a *NumLit) Loc() token.Pos     { return a.Pos }
+func (a *CharLit) Loc() token.Pos    { return a.Pos }
+func (a *StringLit) Loc() token.Pos  { return a.Pos }
+func (a *UnaryExpr) Loc() token.Pos  { return a.Pos }
+func (a *BinaryExpr) Loc() token.Pos { return a.Pos }
+func (a *CallExpr) Loc() token.Pos   { return a.Pos }
 
-func (x *Ident) Lvalue() bool     { return true }
-func (x *NumLit) Lvalue() bool    { return false }
-func (x *CharLit) Lvalue() bool   { return false }
-func (x *StringLit) Lvalue() bool { return false }
-func (x *UnaryExpr) Lvalue() bool { return false }
+func (x *Ident) Lvalue() bool      { return true }
+func (x *NumLit) Lvalue() bool     { return false }
+func (x *CharLit) Lvalue() bool    { return false }
+func (x *StringLit) Lvalue() bool  { return false }
+func (x *UnaryExpr) Lvalue() bool  { return false }
+func (x *BinaryExpr) Lvalue() bool { return false }
+func (x *CallExpr) Lvalue() bool   { return false }
