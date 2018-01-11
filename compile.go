@@ -8,8 +8,6 @@ import (
 	"os"
 	"path"
 	"strings"
-
-	"github.com/davecgh/go-spew/spew"
 )
 
 // Compiled output notes:
@@ -211,6 +209,7 @@ func mkScope() *ast.Scope {
 func Compile(files map[string]*ast.File, fset *token.FileSet, libraryPaths []string) []string {
 	c := newCompiler()
 	c.args = map[string]*Location{}
+	c.fset = fset
 
 	// First pass: Build packages across their multiple files.
 	pkg, err := ast.NewPackage(fset, files, nil, mkScope())
@@ -238,18 +237,14 @@ func Compile(files map[string]*ast.File, fset *token.FileSet, libraryPaths []str
 	}
 
 	// Fourth pass: Type checking all the symbols.
-	for _, pkg := range c.packages {
-		spew.Dump(pkg)
+	for name, pkg := range c.packages {
+		n := c.namespaces[name]
+		c.symbols = n.Symbols
+		c.types = n.Types
 		c.typeCheckAll(pkg)
 	}
 
 	fmt.Println("Successfully parsed and typechecked.")
-	for st := c.symbols; st != nil; st = st.parent {
-		for sym, t := range st.symbols {
-			fmt.Printf("Symbol %s has type %s\n", sym, t.String())
-		}
-	}
-
 	return []string{}
 }
 
@@ -308,8 +303,8 @@ func importClosure(pkg *ast.File, fset *token.FileSet, libraryPaths []string, pa
 	}
 }
 
-func (c *Compiler) typeError(ast AST, format string, args ...interface{}) {
-	pos := c.fset.Position(ast.Loc())
-	args = append([]interface{}{pos.Filename, pos.Line, pos.Column}, args...)
-	log.Fatalf("%s:%d:%d:  "+format, args...)
+func (c *Compiler) typeError(l Located, format string, args ...interface{}) {
+	pos := c.fset.Position(l.Loc()).String()
+	args = append([]interface{}{pos}, args...)
+	log.Fatalf("%s:  "+format, args...)
 }

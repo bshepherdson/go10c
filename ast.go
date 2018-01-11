@@ -4,17 +4,19 @@ import (
 	"go/ast"
 	"go/token"
 	"log"
-
-	"github.com/davecgh/go-spew/spew"
+	"strconv"
 )
 
 // Since we cannot declare methods on foreign types, we follow parsing with a
 // processing pass where we use ast.Walk to comb the tree and convert everything
 // into our local formats.
 
-type AST interface {
+type Located interface {
 	Loc() token.Pos
-	CollectSymbols(*SymbolTable)
+}
+
+type AST interface {
+	Located
 	TypeCheck(*Compiler)
 }
 
@@ -27,6 +29,7 @@ type Package struct {
 // A declaration - of a type, function or variable.
 type Decl interface {
 	AST
+	CollectSymbols(*SymbolTable)
 }
 
 // (Names, Type) pair for variable declarations, function args, struct fields.
@@ -63,8 +66,85 @@ type Statement interface {
 	AST
 }
 
+// An assignment or short declaration.
+type AssignStmt struct {
+	Pos token.Pos
+	Op  token.Token // assignment token, or DEFINE
+	Lhs []Expr
+	Rhs []Expr
+}
+
+// A bare block.
+type BlockStmt struct {
+	Pos  token.Pos
+	Body []Statement
+}
+
+// Control flow statements: break, continue, goto and fallthrough.
+type BranchStmt struct {
+	Pos     token.Pos
+	Flavour token.Token
+	Label   string // Target label, if any.
+}
+
+type DeclStmt struct {
+	Decl *VarDecl
+}
+
+// An expression on its own line; generally this is a call.
+type ExprStmt struct {
+	Expr Expr
+}
+
+type ForStmt struct {
+	Pos  token.Pos
+	Init Statement
+	Cond Expr
+	Post Statement
+	Body []Statement
+}
+
+type IfStmt struct {
+	Pos  token.Pos
+	Init Statement
+	Cond Expr
+	Body []Statement
+	Else Statement // Or nil
+}
+
+type IncDecStmt struct {
+	Pos  token.Pos
+	Expr Expr
+	Op   token.Token
+}
+
+type LabeledStmt struct {
+	Pos   token.Pos
+	Label string
+	Stmt  Statement
+}
+
+type ReturnStmt struct {
+	Pos     token.Pos
+	Results []Expr
+}
+
+// TODO: Select
+
 type Expr interface {
+	Located
 	TypeOf(*Compiler) Type
+	Lvalue() bool // Indicates that this expression can be written to.
+}
+
+type Ident struct {
+	Pos  token.Pos
+	Name string
+}
+
+type NumLit struct {
+	Pos   token.Pos
+	Value int
 }
 
 func astPackage(f *ast.File) *Package {
@@ -104,7 +184,11 @@ func astDecl(di ast.Decl) []Decl {
 					// ts.Names, ts.Type, ts.Values
 					t := astType(ts.Type)
 					for i, ident := range ts.Names {
-						decls = append(decls, &VarDecl{Pos: ts.Pos(), Name: ident.Name, Type: t, Value: astExpr(ts.Values[i])})
+						vd := &VarDecl{Pos: ts.Pos(), Name: ident.Name, Type: t}
+						if ts.Values != nil && len(ts.Values) > 0 {
+							vd.Value = astExpr(ts.Values[i])
+						}
+						decls = append(decls, vd)
 					}
 				} else {
 					log.Fatalf("Can't happen, token.TYPE but not TypeSpec")
@@ -122,6 +206,18 @@ func astDecl(di ast.Decl) []Decl {
 
 		for _, field := range d.Type.Params.List {
 			f.Args = append(f.Args, astField(field))
+		}
+
+		for _, stmt := range d.Body.List {
+			f.Body = append(f.Body, astStmt(stmt))
+		}
+
+		if d.Type.Results != nil {
+			if len(d.Type.Results.List) > 1 {
+				log.Fatalf("Multiple return values are not supported")
+			} else if len(d.Type.Results.List) == 1 {
+				f.ReturnType = astType(d.Type.Results.List[0].Type)
+			}
 		}
 
 		return []Decl{f}
@@ -181,19 +277,108 @@ func astType(ti ast.Expr) Type {
 		return st
 
 	case *ast.Ident:
+		if t.Name == "int" || t.Name == "uint" || t.Name == "char" || t.Name == "bool" || t.Name == "string" {
+			return BuiltinType(t.Name)
+		}
 		return &NamedType{Name: t.Name}
 	}
 
-	spew.Dump(ti)
 	log.Fatalf("Bottom of astType")
 	return nil
 }
 
+func astStmt(iStmt ast.Stmt) Statement {
+	switch stmt := iStmt.(type) {
+	case *ast.AssignStmt:
+		return astAssignStmt(stmt)
+
+		/*
+			case *ast.BlockStmt:
+				b := &BlockStmt{Pos: stmt.Lbrace}
+				for _, s := range b.List {
+					b.Body = append(b.Body, astStmt(s))
+				}
+				return b
+
+			case *ast.BranchStmt:
+				b := &BranchStmt{Pos: stmt.TokPos, Flavour: stmt.Tok}
+				if stmt.Label != nil {
+					b.Label = stmt.Label.Name
+				}
+				return b
+
+			case *ast.DeclStmt:
+				d := astDecl(stmt.Decl)
+				if vd, ok := d.(*VarDecl); ok {
+					return &DeclStmt{vd}
+				}
+				log.Fatal("Cannot declare types or functions inside functions.")
+
+			case *ast.ExprStmt:
+				return &ExprStmt{Expr: astExpr(stmt.X)}
+
+			case *ast.ForStmt:
+				return astForStmt(stmt)
+
+			case *ast.IfStmt:
+				return astIfStmt(stmt)
+
+			case *ast.IncDecStmt:
+				return &IncDecStmt{Pos: stmt.TokPos, Op: stmt.Tok, Expr: astExpr(stmt.X)}
+
+			case *ast.LabeledStmt:
+				return &LabeledStmt{Pos: stmt.Colon, Label: stmt.Label.Name, Stmt: astStmt(stmt.Stmt)}
+		*/
+
+	case *ast.ReturnStmt:
+		r := &ReturnStmt{Pos: stmt.Return}
+		for _, expr := range stmt.Results {
+			r.Results = append(r.Results, astExpr(expr))
+		}
+		return r
+	}
+	return nil
+}
+
+func astAssignStmt(stmt *ast.AssignStmt) *AssignStmt {
+	a := &AssignStmt{Pos: stmt.TokPos, Op: stmt.Tok}
+	for _, lhs := range stmt.Lhs {
+		a.Lhs = append(a.Lhs, astExpr(lhs))
+	}
+	for _, rhs := range stmt.Rhs {
+		a.Rhs = append(a.Rhs, astExpr(rhs))
+	}
+	return a
+}
+
 func astExpr(expr ast.Expr) Expr {
+	switch x := expr.(type) {
+
+	case *ast.BasicLit:
+		switch x.Kind {
+		case token.INT:
+			n := &NumLit{Pos: x.ValuePos}
+			i, _ := strconv.ParseInt(x.Value, 0, 64)
+			n.Value = int(i)
+			return n
+		}
+	}
 	return nil // TODO
 }
 
-func (a *Package) Loc() token.Pos  { return a.Pos }
-func (a *VarDecl) Loc() token.Pos  { return a.Pos }
-func (a *FuncDecl) Loc() token.Pos { return a.Pos }
-func (a *TypeDecl) Loc() token.Pos { return a.Pos }
+func astIdent(expr *ast.Ident) *Ident {
+	return &Ident{Pos: expr.NamePos, Name: expr.Name}
+}
+
+func (a *Package) Loc() token.Pos    { return a.Pos }
+func (a *VarDecl) Loc() token.Pos    { return a.Pos }
+func (a *FuncDecl) Loc() token.Pos   { return a.Pos }
+func (a *TypeDecl) Loc() token.Pos   { return a.Pos }
+func (a *AssignStmt) Loc() token.Pos { return a.Pos }
+func (a *ReturnStmt) Loc() token.Pos { return a.Pos }
+
+func (a *Ident) Loc() token.Pos  { return a.Pos }
+func (a *NumLit) Loc() token.Pos { return a.Pos }
+
+func (x *Ident) Lvalue() bool  { return true }
+func (x *NumLit) Lvalue() bool { return false }

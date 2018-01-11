@@ -18,12 +18,12 @@ func newSymbolTable(parent *SymbolTable) *SymbolTable {
 }
 
 // Returns nil if no symbol with that name is found.
-func (st *SymbolTable) lookup(sym string) Type {
+func (st *SymbolTable) lookup(sym string) (Type, bool) {
 	if t, ok := st.symbols[sym]; ok {
-		return t
+		return t, true
 	}
 	if st.parent == nil {
-		return nil
+		return nil, false
 	}
 	return st.parent.lookup(sym)
 }
