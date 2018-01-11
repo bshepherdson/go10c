@@ -3,6 +3,8 @@ package main
 import (
 	"go/token"
 	"log"
+
+	"github.com/davecgh/go-spew/spew"
 )
 
 func (v *VarDecl) TypeCheck(c *Compiler) {
@@ -134,6 +136,11 @@ func (r *ReturnStmt) TypeCheck(c *Compiler) {
 
 // Expressions
 func (x *Ident) TypeOf(c *Compiler) Type {
+	spew.Dump("Ident", x)
+	if x.Name == "false" || x.Name == "true" {
+		return typeBool
+	}
+
 	if t, ok := c.symbols.lookup(x.Name); ok {
 		return t
 	}
@@ -145,8 +152,48 @@ func (x *NumLit) TypeOf(c *Compiler) Type {
 	return typeInt
 }
 
+func (x *CharLit) TypeOf(c *Compiler) Type {
+	return typeChar
+}
+
+func (x *StringLit) TypeOf(c *Compiler) Type {
+	return typeString
+}
+
+// Legal operations: + - ! ^ * &, plus unsupported <-
+func (x *UnaryExpr) TypeOf(c *Compiler) Type {
+	t := x.Expr.TypeOf(c)
+	tu := t.Underlying()
+	switch x.Op {
+	case token.ADD, token.SUB, token.XOR:
+		// Integers in and out.
+		if tu.Equals(typeInt) || tu.Equals(typeUint) {
+			return t
+		}
+		c.typeError(x, "Cannot apply unary %s to %s", x.Op.String(), t.String())
+
+	case token.NOT:
+		if tu.Equals(typeBool) {
+			return t
+		}
+		c.typeError(x, "Cannot apply ! to %s", t.String())
+
+	case token.AND:
+		return &PointerType{Inner: t}
+
+	case token.MUL:
+		if pt, ok := tu.(*PointerType); ok {
+			return pt.Inner
+		}
+		c.typeError(x, "Cannot dereference non-pointer type %s", t.String())
+	}
+	c.typeError(x, "Unknown unary operator %s", x.Op.String())
+	return nil
+}
+
 func (c *Compiler) typeCheckAll(pkg *Package) {
 	for _, d := range pkg.Decls {
 		d.TypeCheck(c)
+		spew.Dump(d)
 	}
 }

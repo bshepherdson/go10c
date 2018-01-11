@@ -202,6 +202,9 @@ func mkScope() *ast.Scope {
 	s.Insert(ast.NewObj(ast.Typ, "uint"))
 	s.Insert(ast.NewObj(ast.Typ, "string"))
 	s.Insert(ast.NewObj(ast.Typ, "bool"))
+	s.Insert(ast.NewObj(ast.Typ, "char"))
+	s.Insert(ast.NewObj(ast.Con, "false"))
+	s.Insert(ast.NewObj(ast.Con, "true"))
 	return s
 }
 

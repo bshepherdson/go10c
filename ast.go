@@ -147,6 +147,22 @@ type NumLit struct {
 	Value int
 }
 
+type CharLit struct {
+	Pos   token.Pos
+	Value rune
+}
+
+type StringLit struct {
+	Pos   token.Pos
+	Value string
+}
+
+type UnaryExpr struct {
+	Pos  token.Pos
+	Op   token.Token
+	Expr Expr
+}
+
 func astPackage(f *ast.File) *Package {
 	p := &Package{Pos: f.Package, Name: f.Name.Name}
 	for _, d := range f.Decls {
@@ -240,6 +256,7 @@ func astType(ti ast.Expr) Type {
 	case *ast.ArrayType:
 		// We don't support lengths, so we can ignore that clause.
 		return &ArrayType{Inner: astType(t.Elt)}
+
 	case *ast.FuncType:
 		if len(t.Results.List) > 1 || (len(t.Results.List) == 1 && len(t.Results.List[0].Names) > 1) {
 			log.Fatalf("Multiple return values are not supported")
@@ -361,7 +378,22 @@ func astExpr(expr ast.Expr) Expr {
 			i, _ := strconv.ParseInt(x.Value, 0, 64)
 			n.Value = int(i)
 			return n
+		case token.STRING:
+			s := &StringLit{Pos: x.ValuePos}
+			if x.Value[0] != '"' {
+				log.Fatalf("String literal must start with \", got %c", x.Value[0])
+			}
+			s.Value = x.Value[1 : len(x.Value)-1]
+			return s
+		case token.CHAR:
+			return &CharLit{Pos: x.ValuePos, Value: rune(x.Value[1])}
 		}
+
+	case *ast.UnaryExpr:
+		return &UnaryExpr{Pos: x.OpPos, Op: x.Op, Expr: astExpr(x.X)}
+
+	case *ast.Ident:
+		return astIdent(x)
 	}
 	return nil // TODO
 }
@@ -377,8 +409,14 @@ func (a *TypeDecl) Loc() token.Pos   { return a.Pos }
 func (a *AssignStmt) Loc() token.Pos { return a.Pos }
 func (a *ReturnStmt) Loc() token.Pos { return a.Pos }
 
-func (a *Ident) Loc() token.Pos  { return a.Pos }
-func (a *NumLit) Loc() token.Pos { return a.Pos }
+func (a *Ident) Loc() token.Pos     { return a.Pos }
+func (a *NumLit) Loc() token.Pos    { return a.Pos }
+func (a *CharLit) Loc() token.Pos   { return a.Pos }
+func (a *StringLit) Loc() token.Pos { return a.Pos }
+func (a *UnaryExpr) Loc() token.Pos { return a.Pos }
 
-func (x *Ident) Lvalue() bool  { return true }
-func (x *NumLit) Lvalue() bool { return false }
+func (x *Ident) Lvalue() bool     { return true }
+func (x *NumLit) Lvalue() bool    { return false }
+func (x *CharLit) Lvalue() bool   { return false }
+func (x *StringLit) Lvalue() bool { return false }
+func (x *UnaryExpr) Lvalue() bool { return false }
