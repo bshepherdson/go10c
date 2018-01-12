@@ -5,8 +5,6 @@ import (
 	"go/token"
 	"log"
 	"strconv"
-
-	"github.com/davecgh/go-spew/spew"
 )
 
 // Since we cannot declare methods on foreign types, we follow parsing with a
@@ -80,6 +78,11 @@ type AssignStmt struct {
 type BlockStmt struct {
 	Pos  token.Pos
 	Body []Statement
+}
+
+// A nested set of statements - no new scope.
+type NestedStmt struct {
+	Stmts []Statement
 }
 
 // Control flow statements: break, continue, goto and fallthrough.
@@ -256,7 +259,7 @@ func astDecl(di ast.Decl, c *Compiler) []Decl {
 		}
 
 		for _, stmt := range d.Body.List {
-			f.Body = append(f.Body, astStmt(stmt))
+			f.Body = append(f.Body, astStmt(stmt, c))
 		}
 
 		if d.Type.Results != nil {
@@ -334,12 +337,12 @@ func astType(ti ast.Expr, c *Compiler) Type {
 		return &NamedType{Name: t.Name, Compiler: c}
 	}
 
-	spew.Dump(ti)
-	log.Fatalf("Bottom of astType")
+	// This return nil is actually legal, for a nil Type.
+	// That can happen with var foo = bar; the engine should infer.
 	return nil
 }
 
-func astStmt(iStmt ast.Stmt) Statement {
+func astStmt(iStmt ast.Stmt, c *Compiler) Statement {
 	switch stmt := iStmt.(type) {
 	case *ast.AssignStmt:
 		return astAssignStmt(stmt)
@@ -347,40 +350,43 @@ func astStmt(iStmt ast.Stmt) Statement {
 	case *ast.ExprStmt:
 		return &ExprStmt{Pos: stmt.Pos(), Expr: astExpr(stmt.X)}
 
-		/*
-			case *ast.BlockStmt:
-				b := &BlockStmt{Pos: stmt.Lbrace}
-				for _, s := range b.List {
-					b.Body = append(b.Body, astStmt(s))
-				}
-				return b
+	case *ast.IncDecStmt:
+		return &IncDecStmt{Pos: stmt.TokPos, Op: stmt.Tok, Expr: astExpr(stmt.X)}
 
-			case *ast.BranchStmt:
-				b := &BranchStmt{Pos: stmt.TokPos, Flavour: stmt.Tok}
-				if stmt.Label != nil {
-					b.Label = stmt.Label.Name
-				}
-				return b
+	case *ast.DeclStmt:
+		d := astDecl(stmt.Decl, c)
+		ret := &NestedStmt{}
+		for _, vdi := range d {
+			if vd, ok := vdi.(*VarDecl); ok {
+				ret.Stmts = append(ret.Stmts, &DeclStmt{Pos: vd.Pos, Decl: vd})
+			} else {
+				c.typeError(vdi, "Cannot declare functions or types inside functions.")
+			}
+		}
+		return ret
 
-			case *ast.DeclStmt:
-				d := astDecl(stmt.Decl)
-				if vd, ok := d.(*VarDecl); ok {
-					return &DeclStmt{vd}
-				}
-				log.Fatal("Cannot declare types or functions inside functions.")
+	case *ast.LabeledStmt:
+		return &LabeledStmt{Pos: stmt.Colon, Label: stmt.Label.Name, Stmt: astStmt(stmt.Stmt, c)}
 
-			case *ast.ForStmt:
-				return astForStmt(stmt)
+	case *ast.BranchStmt:
+		b := &BranchStmt{Pos: stmt.TokPos, Flavour: stmt.Tok}
+		if stmt.Label != nil {
+			b.Label = stmt.Label.Name
+		}
+		return b
 
-			case *ast.IfStmt:
-				return astIfStmt(stmt)
+	case *ast.BlockStmt:
+		b := &BlockStmt{Pos: stmt.Lbrace}
+		for _, s := range stmt.List {
+			b.Body = append(b.Body, astStmt(s, c))
+		}
+		return b
 
-			case *ast.IncDecStmt:
-				return &IncDecStmt{Pos: stmt.TokPos, Op: stmt.Tok, Expr: astExpr(stmt.X)}
+	case *ast.IfStmt:
+		return astIfStmt(stmt, c)
 
-			case *ast.LabeledStmt:
-				return &LabeledStmt{Pos: stmt.Colon, Label: stmt.Label.Name, Stmt: astStmt(stmt.Stmt)}
-		*/
+	case *ast.ForStmt:
+		return astForStmt(stmt, c)
 
 	case *ast.ReturnStmt:
 		r := &ReturnStmt{Pos: stmt.Return}
@@ -390,6 +396,41 @@ func astStmt(iStmt ast.Stmt) Statement {
 		return r
 	}
 	return nil
+}
+
+func astIfStmt(stmt *ast.IfStmt, c *Compiler) *IfStmt {
+	ret := &IfStmt{Pos: stmt.If}
+	if stmt.Init != nil {
+		ret.Init = astStmt(stmt.Init, c)
+	}
+	ret.Cond = astExpr(stmt.Cond)
+	for _, b := range stmt.Body.List {
+		ret.Body = append(ret.Body, astStmt(b, c))
+	}
+
+	if stmt.Else != nil {
+		ret.Else = astStmt(stmt.Else, c)
+	}
+	return ret
+}
+
+func astForStmt(stmt *ast.ForStmt, c *Compiler) *ForStmt {
+	ret := &ForStmt{Pos: stmt.For}
+	if stmt.Init != nil {
+		ret.Init = astStmt(stmt.Init, c)
+	}
+	if stmt.Cond != nil {
+		ret.Cond = astExpr(stmt.Cond)
+	}
+	if stmt.Post != nil {
+		ret.Post = astStmt(stmt.Post, c)
+	}
+
+	for _, b := range stmt.Body.List {
+		ret.Body = append(ret.Body, astStmt(b, c))
+	}
+
+	return ret
 }
 
 func astAssignStmt(stmt *ast.AssignStmt) *AssignStmt {
@@ -449,6 +490,9 @@ func astExpr(expr ast.Expr) Expr {
 	case *ast.ParenExpr:
 		return astExpr(x.X)
 
+	case *ast.StarExpr:
+		return &UnaryExpr{Pos: x.Star, Op: token.MUL, Expr: astExpr(x.X)}
+
 	case *ast.Ident:
 		return astIdent(x)
 	}
@@ -459,13 +503,21 @@ func astIdent(expr *ast.Ident) *Ident {
 	return &Ident{Pos: expr.NamePos, Name: expr.Name}
 }
 
-func (a *Package) Loc() token.Pos    { return a.Pos }
-func (a *VarDecl) Loc() token.Pos    { return a.Pos }
-func (a *FuncDecl) Loc() token.Pos   { return a.Pos }
-func (a *TypeDecl) Loc() token.Pos   { return a.Pos }
-func (a *AssignStmt) Loc() token.Pos { return a.Pos }
-func (a *ReturnStmt) Loc() token.Pos { return a.Pos }
-func (a *ExprStmt) Loc() token.Pos   { return a.Pos }
+func (a *Package) Loc() token.Pos     { return a.Pos }
+func (a *VarDecl) Loc() token.Pos     { return a.Pos }
+func (a *FuncDecl) Loc() token.Pos    { return a.Pos }
+func (a *TypeDecl) Loc() token.Pos    { return a.Pos }
+func (a *AssignStmt) Loc() token.Pos  { return a.Pos }
+func (a *ReturnStmt) Loc() token.Pos  { return a.Pos }
+func (a *ExprStmt) Loc() token.Pos    { return a.Pos }
+func (a *IncDecStmt) Loc() token.Pos  { return a.Pos }
+func (a *DeclStmt) Loc() token.Pos    { return a.Pos }
+func (a *LabeledStmt) Loc() token.Pos { return a.Pos }
+func (a *NestedStmt) Loc() token.Pos  { return a.Stmts[0].Loc() }
+func (a *BranchStmt) Loc() token.Pos  { return a.Pos }
+func (a *BlockStmt) Loc() token.Pos   { return a.Pos }
+func (a *IfStmt) Loc() token.Pos      { return a.Pos }
+func (a *ForStmt) Loc() token.Pos     { return a.Pos }
 
 func (a *Ident) Loc() token.Pos        { return a.Pos }
 func (a *NumLit) Loc() token.Pos       { return a.Pos }
@@ -483,6 +535,8 @@ func (a *SelectorExpr) Lvalue() bool { return true }
 func (x *NumLit) Lvalue() bool       { return false }
 func (x *CharLit) Lvalue() bool      { return false }
 func (x *StringLit) Lvalue() bool    { return false }
-func (x *UnaryExpr) Lvalue() bool    { return false }
 func (x *BinaryExpr) Lvalue() bool   { return false }
 func (x *CallExpr) Lvalue() bool     { return false }
+func (x *UnaryExpr) Lvalue() bool {
+	return x.Op == token.MUL // Only *foo is an Lvalue.
+}

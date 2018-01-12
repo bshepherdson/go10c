@@ -10,7 +10,9 @@ import (
 func (v *VarDecl) TypeCheck(c *Compiler) {
 	if v.Value != nil {
 		t := v.Value.TypeOf(c)
-		if !t.AssignableTo(v.Type) {
+		if v.Type == nil {
+			v.Type = t
+		} else if !t.AssignableTo(v.Type) {
 			c.typeError(v, "Variable '%s' declared to have type %s, but right-hand side is %s", v.Name, v.Type.String(), t.String())
 		}
 	}
@@ -136,6 +138,96 @@ func (r *ReturnStmt) TypeCheck(c *Compiler) {
 	t := res.TypeOf(c)
 	if !t.AssignableTo(ft.ReturnType) {
 		c.typeError(r, "Returned value has type %s which cannot be assigned to %s", t.String(), ft.ReturnType.String())
+	}
+}
+
+func (s *IncDecStmt) TypeCheck(c *Compiler) {
+	// Works on int and uint values, which must be Lvalues.
+	t := s.Expr.TypeOf(c)
+	tu := t.Underlying()
+	if !tu.Equals(typeInt) && !tu.Equals(typeUint) {
+		c.typeError(s, "Cannot %s a value of type %s", s.Op.String(), t.String())
+	}
+	if !s.Expr.Lvalue() {
+		c.typeError(s, "Read-only values cannot be %s'd", s.Op.String())
+	}
+}
+
+func (s *LabeledStmt) TypeCheck(c *Compiler) {
+	s.Stmt.TypeCheck(c)
+}
+
+func (s *BranchStmt) TypeCheck(c *Compiler) {
+	// Only thing to check here is that the label is required for GOTO.
+	if s.Flavour == token.GOTO && s.Label == "" {
+		c.typeError(s, "goto requires a label")
+	}
+}
+
+func (s *NestedStmt) TypeCheck(c *Compiler) {
+	for _, s2 := range s.Stmts {
+		s2.TypeCheck(c)
+	}
+}
+
+func (s *BlockStmt) TypeCheck(c *Compiler) {
+	origST := c.symbols
+	c.symbols = newSymbolTable(c.symbols)
+	for _, s2 := range s.Body {
+		s2.TypeCheck(c)
+	}
+	c.symbols = origST
+}
+
+func (s *DeclStmt) TypeCheck(c *Compiler) {
+	// Adds the values to the scope.
+	if s.Decl.Type == nil && s.Decl.Value == nil {
+		c.typeError(s, "Variable declarations need either a type or expression")
+	}
+
+	if s.Decl.Type == nil {
+		s.Decl.Type = s.Decl.Value.TypeOf(c)
+	}
+
+	c.symbols.add(s.Decl.Name, s.Decl.Type)
+}
+
+func (s *IfStmt) TypeCheck(c *Compiler) {
+	if s.Init != nil {
+		s.Init.TypeCheck(c)
+	}
+	ct := s.Cond.TypeOf(c)
+	if !ct.Underlying().Equals(typeBool) {
+		c.typeError(s.Cond, "If condition must be bool, found %s", ct.String())
+	}
+
+	for _, b := range s.Body {
+		b.TypeCheck(c)
+	}
+
+	if s.Else != nil {
+		s.Else.TypeCheck(c)
+	}
+}
+
+// Remember that each part of the for header is optional.
+// TODO: Support range.
+func (s *ForStmt) TypeCheck(c *Compiler) {
+	if s.Init != nil {
+		s.Init.TypeCheck(c)
+	}
+	if s.Cond != nil {
+		ct := s.Cond.TypeOf(c)
+		if !ct.Underlying().Equals(typeBool) {
+			c.typeError(s.Cond, "For loop condition must be bool, found %s", ct.String())
+		}
+	}
+	if s.Post != nil {
+		s.Post.TypeCheck(c)
+	}
+
+	for _, b := range s.Body {
+		b.TypeCheck(c)
 	}
 }
 
