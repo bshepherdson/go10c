@@ -11,6 +11,7 @@ type Type interface {
 	ConvertibleTo(Type) bool
 	Equals(Type) bool
 	Underlying() Type
+	Size() int
 	String() string
 }
 
@@ -53,6 +54,10 @@ func (t BuiltinType) Underlying() Type {
 
 func (t BuiltinType) String() string {
 	return string(t)
+}
+
+func (t BuiltinType) Size() int {
+	return 1
 }
 
 // Functions are assignable only if each type is assignable in the appropriate
@@ -156,6 +161,10 @@ func (t *FuncType) String() string {
 	return "func" + receiver + "(" + strings.Join(args, ", ") + ")" + ret
 }
 
+func (t *FuncType) Size() int {
+	return 1
+}
+
 func (t *StructType) structTypeMatch(ot Type, checker func(Type, Type) bool) bool {
 	o, ok := ot.(*StructType)
 	if !ok {
@@ -206,6 +215,16 @@ func (t *StructType) String() string {
 	return "struct { " + strings.Join(fields, ", ") + " }"
 }
 
+func (t *StructType) Size() int {
+	size := 0
+	for _, field := range t.Fields {
+		for range field.Names {
+			size += field.Type.Size()
+		}
+	}
+	return size
+}
+
 type ArrayType struct {
 	Inner Type
 }
@@ -233,6 +252,11 @@ func (t *ArrayType) String() string {
 	return "[]" + t.Inner.String()
 }
 
+func (t *ArrayType) Size() int {
+	return 1 // TODO Maybe turn this into something more like a slice? Pointer,
+	// length and cap.
+}
+
 type PointerType struct {
 	Inner Type
 }
@@ -247,6 +271,9 @@ func (t *PointerType) Equals(ot Type) bool {
 func (t *PointerType) Underlying() Type { return t }
 func (t *PointerType) String() string {
 	return "*" + t.Inner.String()
+}
+func (t *PointerType) Size() int {
+	return 1
 }
 
 type NamedType struct {
@@ -277,4 +304,8 @@ func (t *NamedType) Underlying() Type {
 
 func (t *NamedType) String() string {
 	return t.Name
+}
+
+func (t *NamedType) Size() int {
+	return t.Underlying().Size()
 }

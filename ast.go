@@ -15,8 +15,13 @@ type Located interface {
 	Loc() token.Pos
 }
 
+type CodeGen interface {
+	Gen(*Compiler)
+}
+
 type AST interface {
 	Located
+	CodeGen
 	TypeCheck(*Compiler)
 }
 
@@ -140,8 +145,15 @@ type ReturnStmt struct {
 
 type Expr interface {
 	Located
+	GenExpr(*Compiler, Target)
 	TypeOf(*Compiler) Type
-	Lvalue() bool // Indicates that this expression can be written to.
+	Lvalue() bool          // Indicates that this expression can be written to.
+	AsDArg(*Compiler) DArg // Returns this expression as a DArg, if possible.
+}
+
+// Generic interface for saving expression results passed down from
+type Target interface {
+	Set(interface{})
 }
 
 type Ident struct {

@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
-
-	"github.com/davecgh/go-spew/spew"
 )
 
 func main() {
@@ -27,5 +25,7 @@ func main() {
 	}
 
 	output := Compile(code, fset, []string{})
-	spew.Dump(output)
+	for _, s := range output {
+		fmt.Println(s)
+	}
 }

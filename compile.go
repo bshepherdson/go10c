@@ -33,121 +33,32 @@ import (
 // One of these values will be non-nil.
 
 type Compiler struct {
-	fset         *token.FileSet
-	packages     map[string]*Package
-	namespaces   map[string]*Namespace
-	symbols      *SymbolTable // The current context's symbols.
-	regs         *RegisterState
-	strings      map[string]string    // String literals to write into the binary.
-	types        map[string]Type      // Holds type aliases
-	args         map[string]*Location // Argument names and their current locations.
-	locals       map[string]*Location // Local variables and their current locations.
-	globals      map[string]*Location // Global variables and their current locations.
-	initializers []*Asm               // Code for the initializers of globals.
-	code         []*Asm               // Main line code.
-	this         string               // Name of the current function being compiled, used for labels.
-	packageName  string               // Current package name.
-	unique       int                  // Counter for unique labels.
+	// Global state
+	fset       *token.FileSet
+	packages   map[string]*Package
+	namespaces map[string]*Namespace
+	symbols    *SymbolTable      // The current context's symbols.
+	types      map[string]Type   // Holds type aliases
+	strings    map[string]string // String literals to write into the binary.
+
+	// Code generation state
+	cpu        CPU
+	alloc      *Allocator
+	data       map[string]*Data // Location stacks for the locals and arguments.
+	globals    map[string]*Data // Location stacks for the globals.
+	localCount int              // Running count of local slots in this function.
+
+	initializers   []Outputtable // Code for the initializers of globals.
+	code           []Outputtable // Main line code.
+	this           string        // Name of the current function being compiled, used for labels.
+	initialization bool          // Flag to control which list newly compiled code goes into.
+	packageName    string        // Current package name.
+	unique         int           // Counter for unique labels.
 }
 
 type Namespace struct {
 	Symbols *SymbolTable
 	Types   map[string]Type
-}
-
-type Location interface {
-}
-
-type LocReg string
-type LocStack int    // Relative to the frame pointer (Z).
-type LocLabel string // Stored at this label.
-type LocConstant int // A constant value.
-
-type Asm struct {
-	op      string
-	a       *Arg
-	b       *Arg
-	comment string // Useful for debugging.
-}
-
-var atReg = "reg"
-var atPush = "push"
-var atPop = "pop"
-var atPeek = "peek"
-var atSP = "sp"
-var atPC = "pc"
-var atEX = "ex"
-var atLit = "lit"
-var atAddrLit = "addrLit"
-var atAddrReg = "addrReg"
-var atAddrRegLit = "addrRegLit"
-var atAddrLabel = "addrLabel"
-var atLabel = "label"
-
-type Arg struct {
-	argType  string
-	intValue int
-	strValue string
-}
-
-type ExprResult struct {
-	code   []*Asm
-	result *Arg
-}
-
-type RegisterState struct {
-}
-
-func newRegisterState() *RegisterState {
-	return new(RegisterState)
-}
-
-type Outputtable interface {
-	Output() string
-}
-
-func (a *Asm) Output() string {
-	if a.comment != "" {
-		return "; " + a.comment
-	}
-
-	b := ""
-	if a.b != nil {
-		b = a.b.Output() + ", "
-	}
-	return a.op + b + a.a.Output()
-}
-
-func (a *Arg) Output() string {
-	switch a.argType {
-	case atReg:
-		return a.strValue // Register name
-	case atPush:
-		return "push"
-	case atPop:
-		return "pop"
-	case atPeek:
-		return "peek"
-	case atSP:
-		return "sp"
-	case atPC:
-		return "pc"
-	case atEX:
-		return "ex"
-	case atLit:
-		return fmt.Sprintf("%d", a.intValue)
-	case atAddrLit:
-		return fmt.Sprintf("[%d]", a.intValue)
-	case atAddrRegLit:
-		return fmt.Sprintf("[%s + %d]", a.strValue, a.intValue)
-	case atAddrLit:
-		return fmt.Sprintf("[%s]", a.strValue)
-	case atLabel:
-		return a.strValue
-	default:
-		log.Fatalf("Unknown arg type: %s", a.argType)
-		return "" // Unreachable.
-	}
 }
 
 // So here's the flow:
@@ -186,14 +97,94 @@ func newCompiler() *Compiler {
 	c.namespaces = map[string]*Namespace{}
 	c.packages = map[string]*Package{}
 	c.symbols = newSymbolTable(nil)
-	c.regs = newRegisterState()
+	c.cpu = new(DCPU)
+	c.alloc = newAllocator(c.cpu.RegCount())
 	c.strings = map[string]string{}
 	c.types = map[string]Type{}
-	c.globals = map[string]*Location{}
-	c.initializers = make([]*Asm, 0, 256)
-	c.code = make([]*Asm, 0, 4096)
-	c.unique = 1
+	c.data = []map[string]*Data{}
+	c.globals = map[string]*Data{}
+	c.initializers = make([]Outputtable, 0, 256)
+	c.code = make([]Outputtable, 0, 4096)
+	c.unique = 0
 	return c
+}
+
+// Returns a new unique label belonging to the current package and function.
+func (c *Compiler) packageLabel() string {
+	pkg := c.packageName
+	if pkg == "." {
+		pkg = "main"
+	}
+	return pkg
+}
+
+func (c *Compiler) mkLabel() string {
+	c.unique++
+	return fmt.Sprintf("%s_%s_%d", c.packageLabel(), c.this, c.unique)
+}
+
+func (c *Compiler) namedLabel(base string) string {
+	return fmt.Sprintf("%s_%s_%s", c.packageLabel(), c.this, base)
+}
+
+func (c *Compiler) locate(name string) *Data {
+	for i := len(c.data) - 1; i >= 0; i-- {
+		if d, ok := c.data[i][name]; ok {
+			return d
+		}
+	}
+	return c.globals[name]
+}
+
+// Creates a new data location. Error if one with the same name already exists.
+func (c *Compiler) newData(name string, loc *Location) *Data {
+	if _, ok := c.data[len(c.data)-1][name]; ok {
+		log.Fatalf("Duplicate data definitions for %s", name)
+		return nil
+	}
+	d := &Data{loc: loc}
+	c.data[len(c.data)-1][name] = d
+	return d
+}
+
+// Copy a value into a new location (probably a register). The old location
+// becomes the parent of the new one.
+// Error if the requested value doesn't already exist.
+func (c *Compiler) copyData(name string, loc *Location) *Data {
+	d, ok := c.data[name]
+	if !ok {
+		log.Fatalf("Cannot copy nonexistent data slot %s", name)
+	}
+
+	d2 := &Data{loc: loc, parent: d}
+	c.data[name] = d2
+	return d2
+}
+
+// Replaces a data value with its parent. Emits code to write it out, if
+// necessary.
+// Silently does nothing if a value has no parent. This allows blindly popping
+// everything at the end of a block.
+func (c *Compiler) popData(name string) {
+	d, ok := c.data[name]
+	if !ok {
+		log.Fatalf("Cannot pop nonexistent data slot %s", name)
+	}
+	if d.parent == nil {
+		return
+	}
+
+	if d.dirty {
+		c.cpu.Store(d.loc, d.parent.loc, c)
+	}
+}
+
+func (c *Compiler) compile(o Outputtable) {
+	if c.initialization {
+		c.initializers = append(c.initializers, o)
+	} else {
+		c.code = append(c.code, o)
+	}
 }
 
 func mkScope() *ast.Scope {
@@ -211,7 +202,6 @@ func mkScope() *ast.Scope {
 // Turns a block of parsed files into the output.
 func Compile(files map[string]*ast.File, fset *token.FileSet, libraryPaths []string) []string {
 	c := newCompiler()
-	c.args = map[string]*Location{}
 	c.fset = fset
 
 	// First pass: Build packages across their multiple files.
@@ -248,7 +238,21 @@ func Compile(files map[string]*ast.File, fset *token.FileSet, libraryPaths []str
 	}
 
 	fmt.Println("Successfully parsed and typechecked.")
-	return []string{}
+
+	for name, pkg := range c.packages {
+		n := c.namespaces[name]
+		c.symbols = n.Symbols
+		c.types = n.Types
+		pkg.Gen(c)
+	}
+
+	fmt.Println("Code generation complete")
+
+	out := []string{}
+	for _, o := range c.code {
+		out = append(out, o.Output())
+	}
+	return out
 }
 
 // Recursively includes all the packages imported by the given package.
